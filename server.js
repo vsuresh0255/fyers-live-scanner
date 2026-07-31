@@ -1,4 +1,3 @@
-// test redeploy
 /**
  * Fyers Live Scanner — Railway-hosted version
  * =============================================
@@ -56,6 +55,9 @@ symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null
 let rawSampleCount = 0;
 const MAX_RAW_SAMPLES = 8; // log the first several messages, not just one — the very first is
                             // usually just a connection acknowledgment, not real tick data
+let lastTickReceivedAt = null; // tracks the last REAL price tick, separate from relay-connection status —
+                                 // lets you tell "connected but Fyers feed has gone quiet" apart from
+                                 // "genuinely fine, just between ticks"
 let fyersSocket = null;
 let isLive = false;
 
@@ -98,7 +100,7 @@ function computeScreeners() {
   withVolume.sort((a, b) => b.volume - a.volume);
   const topCount = Math.max(1, Math.ceil(withVolume.length * 0.05));
   const volumeShockers = withVolume.slice(0, topCount);
-  return { openEqLow, openEqHigh, gapNeutral, volumeShockers, updatedAt: new Date().toISOString(), isLive };
+  return { openEqLow, openEqHigh, gapNeutral, volumeShockers, updatedAt: new Date().toISOString(), isLive, lastTickReceivedAt };
 }
 
 // ============ minute-by-minute historical slot tracking ============
@@ -218,6 +220,7 @@ function startFyersConnection(accessToken) {
     const symbol = tick.symbol || tick.s;
     if (symbol && state[symbol]) {
       updateStateFromTick(symbol, tick);
+      lastTickReceivedAt = new Date().toISOString();
       broadcastScreeners();
     }
   });
@@ -331,7 +334,7 @@ const server = http.createServer(async (req, res) => {
 
         const fyers = new fyersModel({ path: __dirname, enableLogging: false });
         fyers.setAppId(APP_ID);
-        fyers.token = `${APP_ID}:${currentAccessToken}`;
+        fyers.setAccessToken(currentAccessToken);
 
         const orderData = {
           symbol,
