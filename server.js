@@ -232,6 +232,35 @@ function startFyersConnection(accessToken) {
   fyersSocket.connect();
 }
 
+// ============ stall watchdog ============
+// The known failure mode with this SDK: the connection can go silent — no error, no
+// close event — it just stops delivering ticks. The SDK's own autoreconnect only
+// fires on an actual error/close, so it never catches this. This checks independently:
+// if we're within market hours and haven't seen a real tick in a while, force a fresh
+// reconnect using the same stored access token, rather than waiting for an error that
+// may never come.
+function isMarketHoursIST(){
+  const now = new Date();
+  const istOffset = 5.5 * 60; // IST is UTC+5:30, in minutes
+  const utcMinutes = now.getUTCHours()*60 + now.getUTCMinutes();
+  const istMinutes = (utcMinutes + istOffset) % (24*60);
+  const day = now.getUTCDay(); // adjust for date-line, but day-of-week is close enough here
+  const isWeekday = day >= 1 && day <= 5;
+  return isWeekday && istMinutes >= (9*60+15) && istMinutes <= (15*60+30);
+}
+
+const STALL_THRESHOLD_MS = 90 * 1000; // 90 seconds with no real tick = considered stalled
+
+setInterval(() => {
+  if(!currentAccessToken || !isMarketHoursIST()) return; // nothing to watch if not logged in or market closed
+  const staleFor = lastTickReceivedAt ? Date.now() - new Date(lastTickReceivedAt).getTime() : Infinity;
+  if(staleFor > STALL_THRESHOLD_MS){
+    console.log(`No real tick for over ${Math.round(staleFor/1000)}s during market hours — forcing a fresh Fyers reconnect (this SDK is known to go silent without an error).`);
+    try{ if(fyersSocket) fyersSocket.close(); } catch(e){ /* ignore */ }
+    startFyersConnection(currentAccessToken);
+  }
+}, 30000); // check every 30 seconds
+
 // ============ web server: auth page + WebSocket relay, sharing one port ============
 const server = http.createServer(async (req, res) => {
   // CORS: your WordPress site and this Railway app are different origins — without
