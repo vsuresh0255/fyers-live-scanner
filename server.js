@@ -174,8 +174,10 @@ function recordMinuteSlot(){
     const freshSymbols = groups[key]
       .map(r => r.symbol)
       .filter(sym => !alreadySeen[key].has(sym));
-    if (freshSymbols.length === 0) return; // nothing NEW this minute — don't add an empty row
     freshSymbols.forEach(sym => alreadySeen[key].add(sym));
+    // always record this minute, even with an empty list — so you can see time actually
+    // progressing (9:15, 9:16, 9:17...) rather than the table looking "stuck" whenever
+    // nothing new happens to qualify that particular minute
     slotHistory[key].push({ time: label, symbols: freshSymbols });
   });
 
