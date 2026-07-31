@@ -50,7 +50,9 @@ console.log(`Loaded ${symbols.length} symbols to track.`);
 // ============ live state per symbol ============
 const state = {};
 symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null }; });
-let loggedRawSample = false;
+let rawSampleCount = 0;
+const MAX_RAW_SAMPLES = 8; // log the first several messages, not just one — the very first is
+                            // usually just a connection acknowledgment, not real tick data
 let fyersSocket = null;
 let isLive = false;
 
@@ -115,9 +117,9 @@ function startFyersConnection(accessToken) {
   });
 
   fyersSocket.on('message', tick => {
-    if (!loggedRawSample) {
-      console.log('\n=== RAW SAMPLE TICK ===\n' + JSON.stringify(tick, null, 2) + '\n=======================\n');
-      loggedRawSample = true;
+    if (rawSampleCount < MAX_RAW_SAMPLES) {
+      rawSampleCount++;
+      console.log(`\n=== RAW SAMPLE ${rawSampleCount}/${MAX_RAW_SAMPLES} ===\n` + JSON.stringify(tick, null, 2) + '\n=======================\n');
     }
     const symbol = tick.symbol || tick.s;
     if (symbol && state[symbol]) {
