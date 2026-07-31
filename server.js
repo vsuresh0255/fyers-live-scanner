@@ -161,8 +161,13 @@ function savePersistedHistory(){
 loadPersistedHistory();
 
 function timeLabel(){
+  // Railway's server clock is very likely UTC, not IST — compute IST explicitly rather
+  // than relying on the container's local timezone, which could show misleading labels
+  // otherwise (e.g. a UTC-based label while you're looking at an IST market clock).
   const now = new Date();
-  return `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+  const istMillis = now.getTime() + (5.5 * 60 * 60 * 1000) + (now.getTimezoneOffset() * 60 * 1000);
+  const ist = new Date(istMillis);
+  return `${String(ist.getUTCHours()).padStart(2,'0')}:${String(ist.getUTCMinutes()).padStart(2,'0')}`;
 }
 
 function recordMinuteSlot(){
@@ -188,11 +193,17 @@ function recordMinuteSlot(){
 // more reliable than a raw 60s interval, which can drift out of alignment with real clock minutes
 let lastRecordedMinute = null;
 setInterval(() => {
-  const label = timeLabel();
-  if (label !== lastRecordedMinute) {
-    lastRecordedMinute = label;
-    recordMinuteSlot();
-    broadcastScreeners(); // push the newly recorded minute out immediately
+  try{
+    const label = timeLabel();
+    if (label !== lastRecordedMinute) {
+      console.log(`Minute changed: ${lastRecordedMinute} -> ${label}, recording new slot.`);
+      lastRecordedMinute = label;
+      recordMinuteSlot();
+      broadcastScreeners(); // push the newly recorded minute out immediately
+      console.log(`Slot recorded successfully. openlow history now has ${slotHistory.openlow.length} entries.`);
+    }
+  } catch(err){
+    console.log('ERROR in minute-recording interval:', err.message, err.stack);
   }
 }, 10000);
 
