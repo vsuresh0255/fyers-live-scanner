@@ -55,6 +55,9 @@ symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null
 let rawSampleCount = 0;
 const MAX_RAW_SAMPLES = 8; // log the first several messages, not just one — the very first is
                             // usually just a connection acknowledgment, not real tick data
+let rawSamplesLoggedThisLifetime = false; // don't re-log raw samples every time it reconnects —
+                                            // this SDK reconnects often, and repeating this every
+                                            // time was drowning out other, more useful log lines
 let lastTickReceivedAt = null; // tracks the last REAL price tick, separate from relay-connection status —
                                  // lets you tell "connected but Fyers feed has gone quiet" apart from
                                  // "genuinely fine, just between ticks"
@@ -226,9 +229,10 @@ function startFyersConnection(accessToken) {
   });
 
   fyersSocket.on('message', tick => {
-    if (rawSampleCount < MAX_RAW_SAMPLES) {
+    if (rawSampleCount < MAX_RAW_SAMPLES && !rawSamplesLoggedThisLifetime) {
       rawSampleCount++;
       console.log(`\n=== RAW SAMPLE ${rawSampleCount}/${MAX_RAW_SAMPLES} ===\n` + JSON.stringify(tick, null, 2) + '\n=======================\n');
+      if(rawSampleCount >= MAX_RAW_SAMPLES) rawSamplesLoggedThisLifetime = true;
     }
     const symbol = tick.symbol || tick.s;
     if (symbol && state[symbol]) {
