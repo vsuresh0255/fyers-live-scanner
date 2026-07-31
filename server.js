@@ -98,6 +98,13 @@ function computeScreeners() {
 
 // ============ Fyers connection (started after auth code submitted) ============
 function startFyersConnection(accessToken) {
+  if (fyersSocket) {
+    console.log('A connection already exists — closing it before starting a fresh one.');
+    try { fyersSocket.close(); } catch (e) { /* ignore */ }
+    fyersSocket = null;
+    isLive = false;
+  }
+
   const fullToken = `${APP_ID}:${accessToken}`;
   fyersSocket = fyersDataSocket.getInstance(fullToken, __dirname, false);
 
