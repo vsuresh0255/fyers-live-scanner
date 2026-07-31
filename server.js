@@ -34,6 +34,8 @@ const SECRET_KEY = process.env.FYERS_SECRET_KEY;
 const REDIRECT_URI = process.env.FYERS_REDIRECT_URI;
 const RELAY_TOKEN = process.env.RELAY_TOKEN;
 
+let currentAccessToken = null; // stored after daily login, needed for placing orders
+
 if (!APP_ID || !SECRET_KEY || !REDIRECT_URI || !RELAY_TOKEN) {
   console.error('\nMissing required environment variables. Set FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI, and RELAY_TOKEN in the Railway dashboard (Variables tab).\n');
   process.exit(1);
@@ -186,11 +188,70 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         startFyersConnection(response.access_token);
+        currentAccessToken = response.access_token;
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end('<p>Success! Connecting to live data feed... <a href="/">Check status</a></p>');
       } catch (err) {
         res.writeHead(500, { 'Content-Type': 'text/html' });
         res.end(`<p>Error: ${err.message}. <a href="/">Try again</a></p>`);
+      }
+    });
+    return;
+  }
+
+  if (parsed.pathname === '/place-order' && req.method === 'POST') {
+    if (parsed.query.token !== RELAY_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid token' }));
+      return;
+    }
+    if (!currentAccessToken) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not logged in to Fyers yet — complete the daily login first' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const order = JSON.parse(body);
+        const { symbol, side, qty, orderType, limitPrice } = order;
+
+        // basic validation — reject anything malformed before it reaches Fyers
+        if (!symbol || !state[symbol]) throw new Error('Unknown or missing symbol');
+        if (side !== 'BUY' && side !== 'SELL') throw new Error('side must be BUY or SELL');
+        const qtyNum = parseInt(qty);
+        if (!qtyNum || qtyNum <= 0) throw new Error('qty must be a positive number');
+        if (orderType !== 'MARKET' && orderType !== 'LIMIT') throw new Error('orderType must be MARKET or LIMIT');
+        if (orderType === 'LIMIT' && (!limitPrice || limitPrice <= 0)) throw new Error('limitPrice required for LIMIT orders');
+
+        const fyers = new fyersModel({ path: __dirname, enableLogging: false });
+        fyers.setAppId(APP_ID);
+        fyers.token = `${APP_ID}:${currentAccessToken}`;
+
+        const orderData = {
+          symbol,
+          qty: qtyNum,
+          type: orderType === 'MARKET' ? 2 : 1,
+          side: side === 'BUY' ? 1 : -1,
+          productType: 'INTRADAY',
+          limitPrice: orderType === 'LIMIT' ? parseFloat(limitPrice) : 0,
+          stopPrice: 0,
+          disclosedQty: 0,
+          validity: 'DAY',
+          offlineOrder: false
+        };
+
+        console.log('Placing order:', JSON.stringify(orderData));
+        const response = await fyers.place_order(orderData);
+        console.log('Order response:', JSON.stringify(response));
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(response));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
       }
     });
     return;
