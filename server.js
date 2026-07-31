@@ -100,6 +100,46 @@ function computeScreeners() {
   return { openEqLow, openEqHigh, gapNeutral, volumeShockers, updatedAt: new Date().toISOString(), isLive };
 }
 
+// ============ minute-by-minute historical slot tracking ============
+// Runs on the SERVER (not per-browser), so a browser connecting at 12:30 still sees
+// what happened at 9:15, 9:20, etc. Each symbol is recorded only in the FIRST minute
+// it qualifies for a given screener — later minutes where it's still qualifying don't
+// repeat it, per your "make it unique" request.
+const slotHistory = { openlow: [], openhigh: [], gapneutral: [] };
+const alreadySeen = { openlow: new Set(), openhigh: new Set(), gapneutral: new Set() };
+
+function timeLabel(){
+  const now = new Date();
+  return `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+}
+
+function recordMinuteSlot(){
+  const snap = computeScreeners();
+  const groups = { openlow: snap.openEqLow, openhigh: snap.openEqHigh, gapneutral: snap.gapNeutral };
+  const label = timeLabel();
+
+  Object.keys(groups).forEach(key => {
+    const freshSymbols = groups[key]
+      .map(r => r.symbol)
+      .filter(sym => !alreadySeen[key].has(sym));
+    if (freshSymbols.length === 0) return; // nothing NEW this minute — don't add an empty row
+    freshSymbols.forEach(sym => alreadySeen[key].add(sym));
+    slotHistory[key].push({ time: label, symbols: freshSymbols });
+  });
+}
+
+// check every 10 seconds whether a new clock-minute has started, and if so, record it —
+// more reliable than a raw 60s interval, which can drift out of alignment with real clock minutes
+let lastRecordedMinute = null;
+setInterval(() => {
+  const label = timeLabel();
+  if (label !== lastRecordedMinute) {
+    lastRecordedMinute = label;
+    recordMinuteSlot();
+    broadcastScreeners(); // push the newly recorded minute out immediately
+  }
+}, 10000);
+
 // ============ Fyers connection (started after auth code submitted) ============
 function startFyersConnection(accessToken) {
   if (fyersSocket) {
@@ -139,6 +179,17 @@ function startFyersConnection(accessToken) {
 
 // ============ web server: auth page + WebSocket relay, sharing one port ============
 const server = http.createServer(async (req, res) => {
+  // CORS: your WordPress site and this Railway app are different origins — without
+  // these headers, the browser blocks the Buy/Sell fetch() requests entirely.
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   const parsed = url.parse(req.url, true);
 
   if (parsed.pathname === '/' && req.method === 'GET') {
@@ -263,6 +314,10 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocket.Server({ server, path: '/live' });
 
+function buildPayload(){
+  return { ...computeScreeners(), slotHistory };
+}
+
 wss.on('connection', (ws, req) => {
   const parsed = url.parse(req.url, true);
   if (parsed.query.token !== RELAY_TOKEN) {
@@ -270,11 +325,11 @@ wss.on('connection', (ws, req) => {
     return;
   }
   console.log('Browser tool connected to relay.');
-  ws.send(JSON.stringify(computeScreeners()));
+  ws.send(JSON.stringify(buildPayload())); // includes full slotHistory so far today
 });
 
 function broadcastScreeners() {
-  const payload = JSON.stringify(computeScreeners());
+  const payload = JSON.stringify(buildPayload());
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) client.send(payload);
   });
