@@ -105,8 +105,57 @@ function computeScreeners() {
 // what happened at 9:15, 9:20, etc. Each symbol is recorded only in the FIRST minute
 // it qualifies for a given screener — later minutes where it's still qualifying don't
 // repeat it, per your "make it unique" request.
-const slotHistory = { openlow: [], openhigh: [], gapneutral: [] };
-const alreadySeen = { openlow: new Set(), openhigh: new Set(), gapneutral: new Set() };
+//
+// PERSISTENCE: written to disk so history survives a Railway redeploy, not just a
+// simple in-memory restart. Requires a Railway Volume mounted at the path below —
+// see the README for setup steps. Without a volume, this still works fine during
+// normal operation (all day, no redeploys); it just won't survive a code update.
+const PERSIST_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
+const PERSIST_FILE = path.join(PERSIST_DIR, 'slot_history.json');
+
+let slotHistory = { openlow: [], openhigh: [], gapneutral: [] };
+let alreadySeen = { openlow: new Set(), openhigh: new Set(), gapneutral: new Set() };
+
+function todayDateKey(){
+  return new Date().toISOString().slice(0, 10);
+}
+
+function loadPersistedHistory(){
+  try{
+    if(!fs.existsSync(PERSIST_FILE)) {
+      console.log('No persisted history file found — starting fresh (this is normal on first run, or if no volume is mounted).');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted history is from a previous day — starting fresh for today.');
+      return;
+    }
+    slotHistory = saved.slotHistory;
+    Object.keys(alreadySeen).forEach(key => {
+      alreadySeen[key] = new Set(saved.alreadySeen[key] || []);
+    });
+    console.log('Restored slot history from disk — survived the restart/redeploy.');
+  } catch(err){
+    console.log('Could not load persisted history (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function savePersistedHistory(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return; // no volume mounted — skip silently, still works in-memory
+    const toSave = {
+      date: todayDateKey(),
+      slotHistory,
+      alreadySeen: { openlow: [...alreadySeen.openlow], openhigh: [...alreadySeen.openhigh], gapneutral: [...alreadySeen.gapneutral] }
+    };
+    fs.writeFileSync(PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save history to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadPersistedHistory();
 
 function timeLabel(){
   const now = new Date();
@@ -126,6 +175,8 @@ function recordMinuteSlot(){
     freshSymbols.forEach(sym => alreadySeen[key].add(sym));
     slotHistory[key].push({ time: label, symbols: freshSymbols });
   });
+
+  savePersistedHistory();
 }
 
 // check every 10 seconds whether a new clock-minute has started, and if so, record it —
