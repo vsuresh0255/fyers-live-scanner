@@ -119,8 +119,8 @@ function computeScreeners() {
 const PERSIST_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
 const PERSIST_FILE = path.join(PERSIST_DIR, 'slot_history.json');
 
-let slotHistory = { openlow: [], openhigh: [], gapneutral: [] };
-let alreadySeen = { openlow: new Set(), openhigh: new Set(), gapneutral: new Set() };
+let slotHistory = { openlow: [], openhigh: [], gapneutral: [], orb5up: [], orb5down: [], orb15up: [], orb15down: [] };
+let alreadySeen = { openlow: new Set(), openhigh: new Set(), gapneutral: new Set(), orb5up: new Set(), orb5down: new Set(), orb15up: new Set(), orb15down: new Set() };
 
 function todayDateKey(){
   return new Date().toISOString().slice(0, 10);
@@ -139,7 +139,8 @@ function loadPersistedHistory(){
     }
     slotHistory = saved.slotHistory;
     Object.keys(alreadySeen).forEach(key => {
-      alreadySeen[key] = new Set(saved.alreadySeen[key] || []);
+      alreadySeen[key] = new Set((saved.alreadySeen && saved.alreadySeen[key]) || []);
+      if(!slotHistory[key]) slotHistory[key] = []; // in case this key didn't exist in an older saved file
     });
     console.log('Restored slot history from disk — survived the restart/redeploy.');
   } catch(err){
@@ -153,7 +154,7 @@ function savePersistedHistory(){
     const toSave = {
       date: todayDateKey(),
       slotHistory,
-      alreadySeen: { openlow: [...alreadySeen.openlow], openhigh: [...alreadySeen.openhigh], gapneutral: [...alreadySeen.gapneutral] }
+      alreadySeen: Object.fromEntries(Object.keys(alreadySeen).map(k => [k, [...alreadySeen[k]]]))
     };
     fs.writeFileSync(PERSIST_FILE, JSON.stringify(toSave));
   } catch(err){
@@ -173,9 +174,79 @@ function timeLabel(){
   return `${String(ist.getUTCHours()).padStart(2,'0')}:${String(ist.getUTCMinutes()).padStart(2,'0')}`;
 }
 
+function getISTDateKeyAndMinutes(){
+  const now = new Date();
+  const istMillis = now.getTime() + (5.5 * 60 * 60 * 1000) + (now.getTimezoneOffset() * 60 * 1000);
+  const ist = new Date(istMillis);
+  const dateKey = `${ist.getUTCFullYear()}-${String(ist.getUTCMonth()+1).padStart(2,'0')}-${String(ist.getUTCDate()).padStart(2,'0')}`;
+  const minutes = ist.getUTCHours()*60 + ist.getUTCMinutes();
+  return { dateKey, minutes };
+}
+
+// ============ Opening Range Breakout (ORB) tracking — 5-min and 15-min ============
+// The opening range for a stock is simply its cumulative high/low from market open (9:15)
+// through the lock time (9:20 for 5-min, 9:30 for 15-min) — since Fyers ticks already carry
+// the cumulative high/low since open, we don't need a separate accumulator, just a snapshot
+// of state[symbol].high/low taken at exactly the right moment.
+const orb5Locked = {};   // symbol -> {high, low}
+const orb15Locked = {};  // symbol -> {high, low}
+let orb5LockedFlag = false;
+let orb15LockedFlag = false;
+let orbLockedDateKey = null; // resets orb5/orb15 fresh each new trading day
+
+function checkAndLockOpeningRanges(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(orbLockedDateKey !== dateKey){
+    // new trading day — clear yesterday's locked ranges and start fresh
+    orbLockedDateKey = dateKey;
+    orb5LockedFlag = false;
+    orb15LockedFlag = false;
+    Object.keys(orb5Locked).forEach(k => delete orb5Locked[k]);
+    Object.keys(orb15Locked).forEach(k => delete orb15Locked[k]);
+  }
+
+  if(!orb5LockedFlag && minutes >= (9*60+20)){
+    Object.keys(state).forEach(symbol => {
+      const s = state[symbol];
+      if(s.high !== null && s.low !== null) orb5Locked[symbol] = { high: s.high, low: s.low };
+    });
+    orb5LockedFlag = true;
+    console.log(`5-min Opening Range locked for ${Object.keys(orb5Locked).length} symbols.`);
+  }
+  if(!orb15LockedFlag && minutes >= (9*60+30)){
+    Object.keys(state).forEach(symbol => {
+      const s = state[symbol];
+      if(s.high !== null && s.low !== null) orb15Locked[symbol] = { high: s.high, low: s.low };
+    });
+    orb15LockedFlag = true;
+    console.log(`15-min Opening Range locked for ${Object.keys(orb15Locked).length} symbols.`);
+  }
+}
+
+function computeOrbBreakouts(minutes){
+  const locked = minutes === 5 ? orb5Locked : orb15Locked;
+  const up = [], down = [];
+  Object.keys(locked).forEach(symbol => {
+    const s = state[symbol];
+    const range = locked[symbol];
+    if(!s || s.ltp === null) return;
+    if(s.ltp > range.high) up.push({ symbol, ltp: s.ltp, orbHigh: range.high, orbLow: range.low });
+    else if(s.ltp < range.low) down.push({ symbol, ltp: s.ltp, orbHigh: range.high, orbLow: range.low });
+  });
+  return { up, down };
+}
+
 function recordMinuteSlot(){
+  checkAndLockOpeningRanges();
+
   const snap = computeScreeners();
-  const groups = { openlow: snap.openEqLow, openhigh: snap.openEqHigh, gapneutral: snap.gapNeutral };
+  const orb5 = computeOrbBreakouts(5);
+  const orb15 = computeOrbBreakouts(15);
+  const groups = {
+    openlow: snap.openEqLow, openhigh: snap.openEqHigh, gapneutral: snap.gapNeutral,
+    orb5up: orb5.up, orb5down: orb5.down, orb15up: orb15.up, orb15down: orb15.down
+  };
   const label = timeLabel();
 
   Object.keys(groups).forEach(key => {
@@ -417,7 +488,15 @@ const server = http.createServer(async (req, res) => {
 const wss = new WebSocket.Server({ server, path: '/live' });
 
 function buildPayload(){
-  return { ...computeScreeners(), slotHistory };
+  const orb5 = computeOrbBreakouts(5);
+  const orb15 = computeOrbBreakouts(15);
+  return {
+    ...computeScreeners(),
+    slotHistory,
+    orb5Up: orb5.up, orb5Down: orb5.down,
+    orb15Up: orb15.up, orb15Down: orb15.down,
+    orb5Locked: orb5LockedFlag, orb15Locked: orb15LockedFlag
+  };
 }
 
 wss.on('connection', (ws, req) => {
