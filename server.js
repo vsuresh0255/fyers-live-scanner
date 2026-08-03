@@ -28,6 +28,16 @@ const url = require('url');
 const WebSocket = require('ws');
 const { fyersModel, fyersDataSocket } = require('fyers-api-v3');
 
+// Safety net: without this, ANY uncaught exception — including ones thrown deep inside
+// Fyers' own SDK code that we can't directly control (e.g. a race condition during
+// reconnect) — crashes the entire Node process, wiping the day's login session and
+// in-memory state. This converts a fatal crash into a logged, recoverable error instead.
+// The underlying triggering bug should still be fixed where possible (see the watchdog
+// grace-period fix below) — this is a backstop, not a substitute for that.
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (recovered, process kept running):', err.message, err.stack);
+});
+
 const PORT = process.env.PORT || 3000;
 const APP_ID = process.env.FYERS_APP_ID;
 const SECRET_KEY = process.env.FYERS_SECRET_KEY;
@@ -63,6 +73,8 @@ let lastTickReceivedAt = null; // tracks the last REAL price tick, separate from
                                  // "genuinely fine, just between ticks"
 let fyersSocket = null;
 let isLive = false;
+let lastConnectionAttemptAt = null; // tracks when the current connection attempt started,
+                                     // so the watchdog can give it a fair grace period
 
 function pick(obj, candidates) {
   for (const key of candidates) {
@@ -290,6 +302,7 @@ function startFyersConnection(accessToken) {
     isLive = false;
   }
 
+  lastConnectionAttemptAt = Date.now();
   const fullToken = `${APP_ID}:${accessToken}`;
   fyersSocket = fyersDataSocket.getInstance(fullToken, __dirname, false);
 
@@ -350,7 +363,16 @@ const STALL_THRESHOLD_MS = 90 * 1000; // 90 seconds with no real tick = consider
 
 setInterval(() => {
   if(!currentAccessToken || !isMarketHoursIST()) return; // nothing to watch if not logged in or market closed
-  const staleFor = lastTickReceivedAt ? Date.now() - new Date(lastTickReceivedAt).getTime() : Infinity;
+
+  // give a freshly-started connection a fair chance to receive its first tick before
+  // judging it — without this, "no tick yet" (normal for the first few seconds) reads
+  // identically to "genuinely stalled", causing the watchdog to fire immediately after
+  // every connect and race against the SDK's own still-in-progress handshake, which is
+  // exactly what caused the uncaught "readyState 0 (CONNECTING)" crashes.
+  const sinceConnectionStarted = lastConnectionAttemptAt ? Date.now() - lastConnectionAttemptAt : Infinity;
+  if(sinceConnectionStarted < STALL_THRESHOLD_MS) return;
+
+  const staleFor = lastTickReceivedAt ? Date.now() - new Date(lastTickReceivedAt).getTime() : sinceConnectionStarted;
   if(staleFor > STALL_THRESHOLD_MS){
     console.log(`No real tick for over ${Math.round(staleFor/1000)}s during market hours — forcing a fresh Fyers reconnect (this SDK is known to go silent without an error).`);
     try{ if(fyersSocket) fyersSocket.close(); } catch(e){ /* ignore */ }
