@@ -177,18 +177,21 @@ function savePersistedHistory(){
 loadPersistedHistory();
 
 function timeLabel(){
-  // Railway's server clock is very likely UTC, not IST — compute IST explicitly rather
-  // than relying on the container's local timezone, which could show misleading labels
-  // otherwise (e.g. a UTC-based label while you're looking at an IST market clock).
+  // Date.now()/getTime() is ALWAYS an absolute UTC timestamp, completely independent of
+  // whatever the server's own local timezone happens to be set to — no need to account
+  // for that separately. Earlier code incorrectly also added the server's local timezone
+  // offset on top of the fixed IST conversion, which only happened to look correct if the
+  // container's local timezone was exactly UTC; if it wasn't, this silently produced the
+  // wrong time. Only add the fixed +5:30 IST offset, nothing else.
   const now = new Date();
-  const istMillis = now.getTime() + (5.5 * 60 * 60 * 1000) + (now.getTimezoneOffset() * 60 * 1000);
+  const istMillis = now.getTime() + (5.5 * 60 * 60 * 1000);
   const ist = new Date(istMillis);
   return `${String(ist.getUTCHours()).padStart(2,'0')}:${String(ist.getUTCMinutes()).padStart(2,'0')}`;
 }
 
 function getISTDateKeyAndMinutes(){
   const now = new Date();
-  const istMillis = now.getTime() + (5.5 * 60 * 60 * 1000) + (now.getTimezoneOffset() * 60 * 1000);
+  const istMillis = now.getTime() + (5.5 * 60 * 60 * 1000);
   const ist = new Date(istMillis);
   const dateKey = `${ist.getUTCFullYear()}-${String(ist.getUTCMonth()+1).padStart(2,'0')}-${String(ist.getUTCDate()).padStart(2,'0')}`;
   const minutes = ist.getUTCHours()*60 + ist.getUTCMinutes();
