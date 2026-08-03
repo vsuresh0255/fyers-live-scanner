@@ -293,6 +293,15 @@ function startFyersConnection(accessToken) {
   const fullToken = `${APP_ID}:${accessToken}`;
   fyersSocket = fyersDataSocket.getInstance(fullToken, __dirname, false);
 
+  // Defensive fix for a real memory leak: Fyers' "getInstance" naming strongly suggests
+  // this may return a shared/singleton object rather than a genuinely fresh one on every
+  // call. Without this, every reconnect (which happens often — see the known SDK
+  // reliability issue) would stack a new set of listeners on top of the old ones,
+  // accumulating hundreds over a trading day and causing the OOM crashes we saw.
+  if (typeof fyersSocket.removeAllListeners === 'function') {
+    fyersSocket.removeAllListeners();
+  }
+
   fyersSocket.on('connect', () => {
     console.log('Connected to Fyers live data feed. Subscribing to', symbols.length, 'symbols...');
     fyersSocket.subscribe(symbols);
@@ -309,7 +318,7 @@ function startFyersConnection(accessToken) {
     if (symbol && state[symbol]) {
       updateStateFromTick(symbol, tick);
       lastTickReceivedAt = new Date().toISOString();
-      broadcastScreeners();
+      scheduleBroadcast();
     }
   });
 
@@ -514,6 +523,16 @@ function broadcastScreeners() {
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) client.send(payload);
   });
+}
+
+// throttle broadcasts to at most once per second — without this, active market hours
+// (Fyers can send 1000+ ticks/sec) would trigger a full computeScreeners() + JSON.stringify
+// + broadcast on every single tick, which is almost certainly what caused the OOM crashes.
+let broadcastPending = false;
+function scheduleBroadcast() {
+  if (broadcastPending) return;
+  broadcastPending = true;
+  setTimeout(() => { broadcastPending = false; broadcastScreeners(); }, 1000);
 }
 
 server.listen(PORT, () => {
