@@ -135,7 +135,12 @@ let slotHistory = { openlow: [], openhigh: [], gapneutral: [], orb5up: [], orb5d
 let alreadySeen = { openlow: new Set(), openhigh: new Set(), gapneutral: new Set(), orb5up: new Set(), orb5down: new Set(), orb15up: new Set(), orb15down: new Set() };
 
 function todayDateKey(){
-  return new Date().toISOString().slice(0, 10);
+  // Must use IST's calendar date, not UTC's — otherwise this disagrees with the
+  // IST-based day-reset logic used elsewhere (e.g. ORB tracking), specifically during
+  // IST evening hours when it's already a new day in IST but still the previous date
+  // in UTC. That mismatch could let a previous day's stale slot history survive a
+  // restart and mix in with today's genuinely fresh entries.
+  return getISTDateKeyAndMinutes().dateKey;
 }
 
 function loadPersistedHistory(){
