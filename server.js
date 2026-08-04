@@ -544,20 +544,58 @@ const server = http.createServer(async (req, res) => {
         startFyersConnection(response.access_token);
         currentAccessToken = response.access_token;
 
-        // ---- TEMPORARY DIAGNOSTIC: verifying the optionchain() REST method works via
-        // this Node.js SDK, and seeing the real NIFTY symbol format it returns — needed
-        // before building the 20-strike NIFTY depth tracking feature. Safe to remove
-        // once confirmed.
+        // ---- TEMPORARY DIAGNOSTIC: verifying the getOptionChain() REST method works
+        // (correct camelCase name, confirmed from the SDK's own source — the Python
+        // docs used a different casing which doesn't apply here), and seeing the real
+        // NIFTY symbol format it returns.
         try{
           fyers.setAccessToken(response.access_token);
-          const chainResponse = await fyers.optionchain({
+          const chainResponse = await fyers.getOptionChain({
             symbol: 'NSE:NIFTY50-INDEX',
             strikecount: 3,
             timestamp: ''
           });
           console.log('\n=== OPTION CHAIN DIAGNOSTIC ===\n' + JSON.stringify(chainResponse, null, 2) + '\n=======================\n');
         } catch(err){
-          console.log('DIAGNOSTIC: optionchain() call threw an error:', err.message);
+          console.log('DIAGNOSTIC: getOptionChain() call threw an error:', err.message);
+        }
+
+        // ---- TEMPORARY DIAGNOSTIC: testing the SEPARATE TBT socket (found in the SDK's
+        // own source), which appears to genuinely support full 50-level depth — different
+        // from the regular DepthUpdate subscription tested earlier, which only gave 5
+        // levels. Testing with SBIN again for a direct comparison.
+        try{
+          const FyersTbtSocket = require('fyers-api-v3/tbtsocket/tbtSocket.js');
+          const tbtFullToken = `${APP_ID}:${response.access_token}`;
+          const tbtSocket = new FyersTbtSocket(tbtFullToken, __dirname, false);
+          let tbtDiagnosticCount = 0;
+
+          tbtSocket.on('depth', (symbol, depth) => {
+            if(tbtDiagnosticCount < 2){
+              tbtDiagnosticCount++;
+              console.log(`\n=== TBT DEPTH DIAGNOSTIC ${tbtDiagnosticCount}/2 (symbol: ${symbol}) ===`);
+              console.log('bidprice (first 10 of 50):', depth.bidprice.slice(0,10));
+              console.log('askprice (first 10 of 50):', depth.askprice.slice(0,10));
+              console.log('bidqty (first 10 of 50):', depth.bidqty.slice(0,10));
+              console.log('askqty (first 10 of 50):', depth.askqty.slice(0,10));
+              console.log('Non-zero bid levels:', depth.bidprice.filter(p => p > 0).length, '/ 50');
+              console.log('Non-zero ask levels:', depth.askprice.filter(p => p > 0).length, '/ 50');
+              console.log('=======================\n');
+            }
+          });
+          tbtSocket.on('error', (err) => {
+            console.log('DIAGNOSTIC: TBT socket error event:', err && err.message ? err.message : err);
+          });
+          tbtSocket.on('servererror', (msg) => {
+            console.log('DIAGNOSTIC: TBT socket server error:', msg);
+          });
+          tbtSocket.on('open', () => {
+            console.log('DIAGNOSTIC: TBT socket connected, subscribing to NSE:SBIN-EQ depth...');
+            tbtSocket.subscribe(['NSE:SBIN-EQ'], 1, 'depth');
+          });
+          tbtSocket.connect();
+        } catch(err){
+          console.log('DIAGNOSTIC: TBT socket setup threw an error:', err.message);
         }
 
         res.writeHead(200, { 'Content-Type': 'text/html' });
