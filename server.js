@@ -102,7 +102,38 @@ function updateStateFromTick(symbol, tick) {
 
 const EPS = 0.01;
 
-function computeScreeners() {
+// ============ 9:15 freeze pool for Gap-Neutral / Open=Low / Open=High ============
+// Per your request: whichever stocks satisfy the condition AT 9:15 become the ONLY
+// stocks ever eligible to appear for the rest of the day — they can drop OUT if they
+// stop qualifying, but no new stock can join later even if it starts qualifying after
+// 9:15. This mirrors the ORB lock pattern but freezes a SET OF SYMBOLS rather than a
+// price range.
+let openLowFrozenPool = null, openHighFrozenPool = null, gapNeutralFrozenPool = null;
+let simpleFreezeLockedFlag = false;
+let simpleFreezeDateKey = null;
+
+function checkAndLockSimpleScreenerPools(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(simpleFreezeDateKey !== dateKey){
+    simpleFreezeDateKey = dateKey;
+    simpleFreezeLockedFlag = false;
+    openLowFrozenPool = null;
+    openHighFrozenPool = null;
+    gapNeutralFrozenPool = null;
+  }
+
+  if(!simpleFreezeLockedFlag && minutes >= (9*60+15)){
+    const snap = computeScreenersUnrestricted();
+    openLowFrozenPool = new Set(snap.openEqLow.map(r => r.symbol));
+    openHighFrozenPool = new Set(snap.openEqHigh.map(r => r.symbol));
+    gapNeutralFrozenPool = new Set(snap.gapNeutral.map(r => r.symbol));
+    simpleFreezeLockedFlag = true;
+    console.log(`9:15 freeze pool locked — Open=Low: ${openLowFrozenPool.size}, Open=High: ${openHighFrozenPool.size}, Gap-Neutral: ${gapNeutralFrozenPool.size} symbols.`);
+  }
+}
+
+function computeScreenersUnrestricted() {
   const openEqLow = [], openEqHigh = [], gapNeutral = [];
   Object.keys(state).forEach(symbol => {
     const s = state[symbol];
@@ -111,6 +142,20 @@ function computeScreeners() {
     if (Math.abs(s.high - s.open) <= EPS) openEqHigh.push({ symbol, open: s.open, high: s.high, ltp: s.ltp });
     if (s.prevClose !== null && Math.abs(s.open - s.prevClose) <= EPS) gapNeutral.push({ symbol, open: s.open, prevClose: s.prevClose, ltp: s.ltp });
   });
+  return { openEqLow, openEqHigh, gapNeutral };
+}
+
+function computeScreeners() {
+  const unrestricted = computeScreenersUnrestricted();
+
+  // once the 9:15 pool is locked, restrict "Right Now" results to ONLY symbols that
+  // were in the original frozen pool — before 9:15, nothing is locked yet, so show
+  // everything currently qualifying (matches the old, unrestricted behavior for the
+  // few minutes before the freeze point)
+  const openEqLow = openLowFrozenPool ? unrestricted.openEqLow.filter(r => openLowFrozenPool.has(r.symbol)) : unrestricted.openEqLow;
+  const openEqHigh = openHighFrozenPool ? unrestricted.openEqHigh.filter(r => openHighFrozenPool.has(r.symbol)) : unrestricted.openEqHigh;
+  const gapNeutral = gapNeutralFrozenPool ? unrestricted.gapNeutral.filter(r => gapNeutralFrozenPool.has(r.symbol)) : unrestricted.gapNeutral;
+
   const withVolume = Object.entries(state).filter(([, s]) => s.volume !== null).map(([symbol, s]) => ({ symbol, volume: s.volume, ltp: s.ltp }));
   withVolume.sort((a, b) => b.volume - a.volume);
   const topCount = Math.max(1, Math.ceil(withVolume.length * 0.05));
@@ -262,6 +307,7 @@ let lastKnownDateKey = null; // tracks the day slotHistory currently belongs to,
 
 function recordMinuteSlot(){
   checkAndLockOpeningRanges();
+  checkAndLockSimpleScreenerPools();
 
   // detect a day rollover DURING ongoing operation — without this, a server that stays
   // running overnight (rather than restarting) never re-checks the date, so slotHistory
