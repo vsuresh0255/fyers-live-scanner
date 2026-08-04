@@ -226,7 +226,7 @@ function checkAndLockOpeningRanges(){
     Object.keys(orb15Locked).forEach(k => delete orb15Locked[k]);
   }
 
-  if(!orb5LockedFlag && minutes >= (9*60+20)){
+  if(!orb5LockedFlag && minutes >= (9*60+25)){
     Object.keys(state).forEach(symbol => {
       const s = state[symbol];
       if(s.high !== null && s.low !== null) orb5Locked[symbol] = { high: s.high, low: s.low };
@@ -234,7 +234,7 @@ function checkAndLockOpeningRanges(){
     orb5LockedFlag = true;
     console.log(`5-min Opening Range locked for ${Object.keys(orb5Locked).length} symbols.`);
   }
-  if(!orb15LockedFlag && minutes >= (9*60+30)){
+  if(!orb15LockedFlag && minutes >= (9*60+35)){
     Object.keys(state).forEach(symbol => {
       const s = state[symbol];
       if(s.high !== null && s.low !== null) orb15Locked[symbol] = { high: s.high, low: s.low };
@@ -257,8 +257,22 @@ function computeOrbBreakouts(minutes){
   return { up, down };
 }
 
+let lastKnownDateKey = null; // tracks the day slotHistory currently belongs to, so an
+                              // ongoing (not restarted) server correctly resets at midnight
+
 function recordMinuteSlot(){
   checkAndLockOpeningRanges();
+
+  // detect a day rollover DURING ongoing operation — without this, a server that stays
+  // running overnight (rather than restarting) never re-checks the date, so slotHistory
+  // from yesterday just keeps accumulating instead of resetting for the new trading day.
+  const currentDateKey = todayDateKey();
+  if(lastKnownDateKey !== null && lastKnownDateKey !== currentDateKey){
+    console.log(`Trading day changed (${lastKnownDateKey} -> ${currentDateKey}) — resetting slot history for the new day.`);
+    Object.keys(slotHistory).forEach(key => { slotHistory[key] = []; });
+    Object.keys(alreadySeen).forEach(key => { alreadySeen[key] = new Set(); });
+  }
+  lastKnownDateKey = currentDateKey;
 
   const snap = computeScreeners();
   const orb5 = computeOrbBreakouts(5);
