@@ -393,8 +393,22 @@ function startFyersConnection(accessToken) {
       console.log('Subscribing to', symbols.length, 'symbols...');
       fyersSocket.subscribe(symbols);
       isLive = true;
+
+      // ---- TEMPORARY DIAGNOSTIC: checking whether full 50-level market depth is
+      // actually available on this account via the standard API (separate from the
+      // regular tick subscription above — this doesn't touch or affect it either way).
+      // Safe to remove once we've confirmed what depth data actually comes back.
+      try{
+        console.log('DIAGNOSTIC: attempting DepthUpdate subscription for NSE:SBIN-EQ to check available depth levels...');
+        fyersSocket.subscribe(['NSE:SBIN-EQ'], 'DepthUpdate');
+      } catch(err){
+        console.log('DIAGNOSTIC: DepthUpdate subscribe threw an error:', err.message);
+      }
     }, 2000);
   });
+
+  let depthDiagnosticLoggedCount = 0;
+  const MAX_DEPTH_DIAGNOSTIC_SAMPLES = 3;
 
   fyersSocket.on('message', tick => {
     if (rawSampleCount < MAX_RAW_SAMPLES && !rawSamplesLoggedThisLifetime) {
@@ -402,6 +416,17 @@ function startFyersConnection(accessToken) {
       console.log(`\n=== RAW SAMPLE ${rawSampleCount}/${MAX_RAW_SAMPLES} ===\n` + JSON.stringify(tick, null, 2) + '\n=======================\n');
       if(rawSampleCount >= MAX_RAW_SAMPLES) rawSamplesLoggedThisLifetime = true;
     }
+
+    // ---- TEMPORARY DIAGNOSTIC: separately from the regular tick sample budget above,
+    // specifically catch and log anything that looks like a depth/DOM message (different
+    // "type" than the known regular-tick types) so we can see the real field names and
+    // how many bid/ask levels actually come back. Safe to remove once confirmed.
+    const knownRegularTypes = ['sf', 'cn', 'cr', 'sub', 'cp'];
+    if (depthDiagnosticLoggedCount < MAX_DEPTH_DIAGNOSTIC_SAMPLES && tick && tick.type && !knownRegularTypes.includes(tick.type)) {
+      depthDiagnosticLoggedCount++;
+      console.log(`\n=== DEPTH DIAGNOSTIC SAMPLE ${depthDiagnosticLoggedCount}/${MAX_DEPTH_DIAGNOSTIC_SAMPLES} (type: "${tick.type}") ===\n` + JSON.stringify(tick, null, 2) + '\n=======================\n');
+    }
+
     const symbol = tick.symbol || tick.s;
     if (symbol && state[symbol]) {
       updateStateFromTick(symbol, tick);
