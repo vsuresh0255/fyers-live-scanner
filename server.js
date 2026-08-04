@@ -1,4 +1,4 @@
-/**
+// force rebuild [04-aug-2026]/**
  * Fyers Live Scanner — Railway-hosted version
  * =============================================
  * Same purpose as the local version, adapted to run on Railway instead of your
