@@ -543,6 +543,23 @@ const server = http.createServer(async (req, res) => {
         }
         startFyersConnection(response.access_token);
         currentAccessToken = response.access_token;
+
+        // ---- TEMPORARY DIAGNOSTIC: verifying the optionchain() REST method works via
+        // this Node.js SDK, and seeing the real NIFTY symbol format it returns — needed
+        // before building the 20-strike NIFTY depth tracking feature. Safe to remove
+        // once confirmed.
+        try{
+          fyers.setAccessToken(response.access_token);
+          const chainResponse = await fyers.optionchain({
+            symbol: 'NSE:NIFTY50-INDEX',
+            strikecount: 3,
+            timestamp: ''
+          });
+          console.log('\n=== OPTION CHAIN DIAGNOSTIC ===\n' + JSON.stringify(chainResponse, null, 2) + '\n=======================\n');
+        } catch(err){
+          console.log('DIAGNOSTIC: optionchain() call threw an error:', err.message);
+        }
+
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end('<p>Success! Connecting to live data feed... <a href="/">Check status</a></p>');
       } catch (err) {
