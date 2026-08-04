@@ -1,4 +1,4 @@
-// force rebuild [04-aug-2026]/**
+/**
  * Fyers Live Scanner — Railway-hosted version
  * =============================================
  * Same purpose as the local version, adapted to run on Railway instead of your
@@ -658,5 +658,6 @@ function scheduleBroadcast() {
 }
 
 server.listen(PORT, () => {
+  console.log(`*** VERSION CHECK: BUILD-${new Date().toISOString()} — if you don't see this exact marker, this deployment is NOT running the latest code ***`);
   console.log(`Server listening on port ${PORT}. Visit your Railway URL to complete daily login.`);
 });
