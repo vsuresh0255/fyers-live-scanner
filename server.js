@@ -324,9 +324,16 @@ function startFyersConnection(accessToken) {
   }
 
   fyersSocket.on('connect', () => {
-    console.log('Connected to Fyers live data feed. Subscribing to', symbols.length, 'symbols...');
-    fyersSocket.subscribe(symbols);
-    isLive = true;
+    console.log('Connected to Fyers live data feed. Waiting briefly before subscribing (a brand-new token can take a moment to fully activate on Fyers\' side)...');
+    // Small delay before the actual subscribe call — working theory for the "Please
+    // provide valid token" error seen immediately after a fresh login: the token is
+    // valid enough for the initial connection handshake, but may need a moment to
+    // fully propagate on Fyers' backend before it's accepted for subscribe-level auth.
+    setTimeout(() => {
+      console.log('Subscribing to', symbols.length, 'symbols...');
+      fyersSocket.subscribe(symbols);
+      isLive = true;
+    }, 2000);
   });
 
   fyersSocket.on('message', tick => {
