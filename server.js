@@ -26,6 +26,13 @@ const path = require('path');
 const http = require('http');
 const url = require('url');
 const WebSocket = require('ws');
+// Patches a real bug in fyers-api-v3's tbtsocket/tbtSocket.js: it calls https.get()
+// without importing 'https' first, causing "https is not defined" and silently falling
+// back to a generic hardcoded URL instead of fetching the real, account-specific socket
+// URL. Making it available globally here fixes this without needing to touch node_modules
+// (which gets reinstalled fresh on every deploy anyway).
+global.https = require('https');
+
 const { fyersModel, fyersDataSocket } = require('fyers-api-v3');
 
 // Safety net: without this, ANY uncaught exception — including ones thrown deep inside
