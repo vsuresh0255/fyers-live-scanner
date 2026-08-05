@@ -69,12 +69,6 @@ console.log(`Loaded ${symbols.length} symbols to track.`);
 // ============ live state per symbol ============
 const state = {};
 symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null }; });
-let rawSampleCount = 0;
-const MAX_RAW_SAMPLES = 8; // log the first several messages, not just one — the very first is
-                            // usually just a connection acknowledgment, not real tick data
-let rawSamplesLoggedThisLifetime = false; // don't re-log raw samples every time it reconnects —
-                                            // this SDK reconnects often, and repeating this every
-                                            // time was drowning out other, more useful log lines
 let lastTickReceivedAt = null; // tracks the last REAL price tick, separate from relay-connection status —
                                  // lets you tell "connected but Fyers feed has gone quiet" apart from
                                  // "genuinely fine, just between ticks"
@@ -400,40 +394,10 @@ function startFyersConnection(accessToken) {
       console.log('Subscribing to', symbols.length, 'symbols...');
       fyersSocket.subscribe(symbols);
       isLive = true;
-
-      // ---- TEMPORARY DIAGNOSTIC: checking whether full 50-level market depth is
-      // actually available on this account via the standard API (separate from the
-      // regular tick subscription above — this doesn't touch or affect it either way).
-      // Safe to remove once we've confirmed what depth data actually comes back.
-      try{
-        console.log('DIAGNOSTIC: attempting DepthUpdate subscription for NSE:SBIN-EQ to check available depth levels...');
-        fyersSocket.subscribe(['NSE:SBIN-EQ'], 'DepthUpdate');
-      } catch(err){
-        console.log('DIAGNOSTIC: DepthUpdate subscribe threw an error:', err.message);
-      }
     }, 2000);
   });
 
-  let depthDiagnosticLoggedCount = 0;
-  const MAX_DEPTH_DIAGNOSTIC_SAMPLES = 3;
-
   fyersSocket.on('message', tick => {
-    if (rawSampleCount < MAX_RAW_SAMPLES && !rawSamplesLoggedThisLifetime) {
-      rawSampleCount++;
-      console.log(`\n=== RAW SAMPLE ${rawSampleCount}/${MAX_RAW_SAMPLES} ===\n` + JSON.stringify(tick, null, 2) + '\n=======================\n');
-      if(rawSampleCount >= MAX_RAW_SAMPLES) rawSamplesLoggedThisLifetime = true;
-    }
-
-    // ---- TEMPORARY DIAGNOSTIC: separately from the regular tick sample budget above,
-    // specifically catch and log anything that looks like a depth/DOM message (different
-    // "type" than the known regular-tick types) so we can see the real field names and
-    // how many bid/ask levels actually come back. Safe to remove once confirmed.
-    const knownRegularTypes = ['sf', 'cn', 'cr', 'sub', 'cp'];
-    if (depthDiagnosticLoggedCount < MAX_DEPTH_DIAGNOSTIC_SAMPLES && tick && tick.type && !knownRegularTypes.includes(tick.type)) {
-      depthDiagnosticLoggedCount++;
-      console.log(`\n=== DEPTH DIAGNOSTIC SAMPLE ${depthDiagnosticLoggedCount}/${MAX_DEPTH_DIAGNOSTIC_SAMPLES} (type: "${tick.type}") ===\n` + JSON.stringify(tick, null, 2) + '\n=======================\n');
-    }
-
     const symbol = tick.symbol || tick.s;
     if (symbol && state[symbol]) {
       updateStateFromTick(symbol, tick);
@@ -550,22 +514,6 @@ const server = http.createServer(async (req, res) => {
         }
         startFyersConnection(response.access_token);
         currentAccessToken = response.access_token;
-
-        // ---- TEMPORARY DIAGNOSTIC: verifying the getOptionChain() REST method works
-        // (correct camelCase name, confirmed from the SDK's own source — the Python
-        // docs used a different casing which doesn't apply here), and seeing the real
-        // NIFTY symbol format it returns.
-        try{
-          fyers.setAccessToken(response.access_token);
-          const chainResponse = await fyers.getOptionChain({
-            symbol: 'NSE:NIFTY50-INDEX',
-            strikecount: 3,
-            timestamp: ''
-          });
-          console.log('\n=== OPTION CHAIN DIAGNOSTIC ===\n' + JSON.stringify(chainResponse, null, 2) + '\n=======================\n');
-        } catch(err){
-          console.log('DIAGNOSTIC: getOptionChain() call threw an error:', err.message);
-        }
 
         // ---- TEMPORARY DIAGNOSTIC: testing the SEPARATE TBT socket (found in the SDK's
         // own source), which appears to genuinely support full 50-level depth — different
