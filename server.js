@@ -596,9 +596,17 @@ const server = http.createServer(async (req, res) => {
           tbtSocket.on('servererror', (msg) => {
             console.log('DIAGNOSTIC: TBT socket server error:', msg);
           });
+          tbtSocket.on('close', (event) => {
+            console.log('DIAGNOSTIC: TBT socket closed. Event:', event && event.code ? `code=${event.code}` : event);
+          });
           tbtSocket.on('open', () => {
             console.log('DIAGNOSTIC: TBT socket connected, subscribing to NSE:SBIN-EQ depth...');
             tbtSocket.subscribe(['NSE:SBIN-EQ'], 1, 'depth');
+            setTimeout(() => {
+              if(tbtDiagnosticCount === 0){
+                console.log('DIAGNOSTIC: 10 seconds since subscribing — still no depth event received. isConnected():', tbtSocket.isConnected());
+              }
+            }, 10000);
           });
           tbtSocket.connect();
         } catch(err){
