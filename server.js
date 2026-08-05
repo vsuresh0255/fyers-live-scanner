@@ -77,6 +77,35 @@ let isLive = false;
 let lastConnectionAttemptAt = null; // tracks when the current connection attempt started,
                                      // so the watchdog can give it a fair grace period
 
+// ============ tracked strike depth (user enters one strike, we watch its CE+PE) ============
+let trackedStrikeSymbols = { ce: null, pe: null, strike: null };
+let trackedStrikeDepth = { ce: null, pe: null }; // { maxBuyPrice, maxBuyQty, maxSellPrice, maxSellQty, source: '5-level'|'50-level' }
+let currentTbtSocket = null; // so a new strike lookup can unsubscribe the old symbols first
+
+// given a 5-level depth tick (bid_price1-5/ask_price1-5/bid_size1-5/ask_size1-5), finds
+// which price level has the largest quantity on each side
+function computeMaxLevelsFrom5(tick){
+  let maxBuyQty = -1, maxBuyPrice = null, maxSellQty = -1, maxSellPrice = null;
+  for(let i = 1; i <= 5; i++){
+    const bidPrice = tick[`bid_price${i}`], bidSize = tick[`bid_size${i}`];
+    const askPrice = tick[`ask_price${i}`], askSize = tick[`ask_size${i}`];
+    if(bidPrice > 0 && bidSize > maxBuyQty){ maxBuyQty = bidSize; maxBuyPrice = bidPrice; }
+    if(askPrice > 0 && askSize > maxSellQty){ maxSellQty = askSize; maxSellPrice = askPrice; }
+  }
+  return { maxBuyPrice, maxBuyQty: maxBuyQty >= 0 ? maxBuyQty : null, maxSellPrice, maxSellQty: maxSellQty >= 0 ? maxSellQty : null, source: '5-level' };
+}
+
+// given a TBT depth object (50-element bidprice/askprice/bidqty/askqty arrays), finds the
+// same thing across the full depth
+function computeMaxLevelsFrom50(depth){
+  let maxBuyQty = -1, maxBuyPrice = null, maxSellQty = -1, maxSellPrice = null;
+  for(let i = 0; i < 50; i++){
+    if(depth.bidprice[i] > 0 && depth.bidqty[i] > maxBuyQty){ maxBuyQty = depth.bidqty[i]; maxBuyPrice = depth.bidprice[i]; }
+    if(depth.askprice[i] > 0 && depth.askqty[i] > maxSellQty){ maxSellQty = depth.askqty[i]; maxSellPrice = depth.askprice[i]; }
+  }
+  return { maxBuyPrice, maxBuyQty: maxBuyQty >= 0 ? maxBuyQty : null, maxSellPrice, maxSellQty: maxSellQty >= 0 ? maxSellQty : null, source: '50-level' };
+}
+
 function pick(obj, candidates) {
   for (const key of candidates) {
     if (obj[key] !== undefined && obj[key] !== null) return obj[key];
@@ -404,6 +433,18 @@ function startFyersConnection(accessToken) {
       lastTickReceivedAt = new Date().toISOString();
       scheduleBroadcast();
     }
+
+    // separately, check if this is a depth tick for our currently-tracked strike's
+    // CE or PE symbol (these aren't in `state`, since that's only the fixed 210-stock list)
+    if (tick && tick.type === 'dp' && symbol) {
+      if (symbol === trackedStrikeSymbols.ce) {
+        trackedStrikeDepth.ce = computeMaxLevelsFrom5(tick);
+        scheduleBroadcast();
+      } else if (symbol === trackedStrikeSymbols.pe) {
+        trackedStrikeDepth.pe = computeMaxLevelsFrom5(tick);
+        scheduleBroadcast();
+      }
+    }
   });
 
   fyersSocket.on('error', msg => console.error('Fyers WS error:', msg));
@@ -515,50 +556,41 @@ const server = http.createServer(async (req, res) => {
         startFyersConnection(response.access_token);
         currentAccessToken = response.access_token;
 
-        // ---- TEMPORARY DIAGNOSTIC: testing the SEPARATE TBT socket (found in the SDK's
-        // own source), which appears to genuinely support full 50-level depth — different
-        // from the regular DepthUpdate subscription tested earlier, which only gave 5
-        // levels. Testing with SBIN again for a direct comparison.
+        // Sets up the TBT socket (potential 50-level depth, separate from the confirmed
+        // 5-level DepthUpdate feed) so it's ready whenever a strike gets tracked via
+        // /track-strike — stored globally so it's reused across strike changes rather
+        // than reconnecting every time.
         try{
           const FyersTbtSocket = require('fyers-api-v3/tbtsocket/tbtSocket.js');
           const tbtFullToken = `${APP_ID}:${response.access_token}`;
           const tbtSocket = new FyersTbtSocket(tbtFullToken, __dirname, false);
-          let tbtDiagnosticCount = 0;
 
           tbtSocket.on('depth', (symbol, depth) => {
-            if(tbtDiagnosticCount < 2){
-              tbtDiagnosticCount++;
-              console.log(`\n=== TBT DEPTH DIAGNOSTIC ${tbtDiagnosticCount}/2 (symbol: ${symbol}) ===`);
-              console.log('bidprice (first 10 of 50):', depth.bidprice.slice(0,10));
-              console.log('askprice (first 10 of 50):', depth.askprice.slice(0,10));
-              console.log('bidqty (first 10 of 50):', depth.bidqty.slice(0,10));
-              console.log('askqty (first 10 of 50):', depth.askqty.slice(0,10));
-              console.log('Non-zero bid levels:', depth.bidprice.filter(p => p > 0).length, '/ 50');
-              console.log('Non-zero ask levels:', depth.askprice.filter(p => p > 0).length, '/ 50');
-              console.log('=======================\n');
+            if (symbol === trackedStrikeSymbols.ce) {
+              trackedStrikeDepth.ce = computeMaxLevelsFrom50(depth);
+              scheduleBroadcast();
+            } else if (symbol === trackedStrikeSymbols.pe) {
+              trackedStrikeDepth.pe = computeMaxLevelsFrom50(depth);
+              scheduleBroadcast();
             }
           });
           tbtSocket.on('error', (err) => {
-            console.log('DIAGNOSTIC: TBT socket error event:', err && err.message ? err.message : err);
+            console.log('TBT socket error event:', err && err.message ? err.message : err);
           });
           tbtSocket.on('servererror', (msg) => {
-            console.log('DIAGNOSTIC: TBT socket server error:', msg);
+            console.log('TBT socket server error:', msg);
           });
           tbtSocket.on('close', (event) => {
-            console.log('DIAGNOSTIC: TBT socket closed. Event:', event && event.code ? `code=${event.code}` : event);
+            console.log('TBT socket closed. Event:', event && event.code ? `code=${event.code}` : event);
+            currentTbtSocket = null;
           });
           tbtSocket.on('open', () => {
-            console.log('DIAGNOSTIC: TBT socket connected, subscribing to NSE:SBIN-EQ depth...');
-            tbtSocket.subscribe(['NSE:SBIN-EQ'], 1, 'depth');
-            setTimeout(() => {
-              if(tbtDiagnosticCount === 0){
-                console.log('DIAGNOSTIC: 10 seconds since subscribing — still no depth event received. isConnected():', tbtSocket.isConnected());
-              }
-            }, 10000);
+            console.log('TBT socket connected and ready.');
+            currentTbtSocket = tbtSocket;
           });
           tbtSocket.connect();
         } catch(err){
-          console.log('DIAGNOSTIC: TBT socket setup threw an error:', err.message);
+          console.log('TBT socket setup threw an error:', err.message);
         }
 
         res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -630,6 +662,82 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/track-strike' && req.method === 'POST') {
+    if (parsed.query.token !== RELAY_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid token' }));
+      return;
+    }
+    if (!currentAccessToken) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not logged in to Fyers yet — complete the daily login first' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { strike } = JSON.parse(body);
+        const strikeNum = parseFloat(strike);
+        if (!strikeNum || strikeNum <= 0) throw new Error('strike must be a positive number');
+
+        const fyers = new fyersModel({ path: __dirname, enableLogging: false });
+        fyers.setAppId(APP_ID);
+        fyers.setAccessToken(currentAccessToken);
+
+        const chainResponse = await fyers.getOptionChain({
+          symbol: 'NSE:NIFTY50-INDEX',
+          strikecount: 30, // wide enough net that our requested strike is almost certainly in it
+          timestamp: ''
+        });
+        if (chainResponse.s !== 'ok' && chainResponse.code !== 200) {
+          throw new Error('getOptionChain failed: ' + JSON.stringify(chainResponse));
+        }
+
+        const matchCE = chainResponse.data.optionsChain.find(o => o.strike_price === strikeNum && o.option_type === 'CE');
+        const matchPE = chainResponse.data.optionsChain.find(o => o.strike_price === strikeNum && o.option_type === 'PE');
+        if (!matchCE || !matchPE) {
+          throw new Error(`Strike ${strikeNum} not found in the current option chain — check the value and that it's a valid NIFTY strike interval`);
+        }
+
+        console.log(`Tracking strike ${strikeNum}: CE=${matchCE.symbol}, PE=${matchPE.symbol}`);
+
+        // unsubscribe from any previously-tracked strike's symbols first
+        if (trackedStrikeSymbols.ce || trackedStrikeSymbols.pe) {
+          try {
+            fyersSocket.unsubscribe([trackedStrikeSymbols.ce, trackedStrikeSymbols.pe].filter(Boolean), 'DepthUpdate');
+          } catch(e){ /* best-effort — a failed unsubscribe of the old symbols isn't fatal */ }
+        }
+
+        trackedStrikeSymbols = { ce: matchCE.symbol, pe: matchPE.symbol, strike: strikeNum };
+        trackedStrikeDepth = { ce: null, pe: null };
+
+        // subscribe on the regular (confirmed-working, 5-level) feed
+        fyersSocket.subscribe([matchCE.symbol, matchPE.symbol], 'DepthUpdate');
+
+        // also try the TBT (potential 50-level) feed for the same two symbols, on the
+        // shared TBT socket set up at login — reused across strike changes rather than
+        // reconnecting each time
+        if (currentTbtSocket) {
+          try {
+            currentTbtSocket.subscribe([matchCE.symbol, matchPE.symbol], 1, 'depth');
+          } catch(e){
+            console.log('TBT subscribe for tracked strike threw:', e.message);
+          }
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ strike: strikeNum, ce: matchCE.symbol, pe: matchPE.symbol }));
+      } catch (err) {
+        console.log('track-strike threw an exception:', err.message);
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -644,7 +752,9 @@ function buildPayload(){
     slotHistory,
     orb5Up: orb5.up, orb5Down: orb5.down,
     orb15Up: orb15.up, orb15Down: orb15.down,
-    orb5Locked: orb5LockedFlag, orb15Locked: orb15LockedFlag
+    orb5Locked: orb5LockedFlag, orb15Locked: orb15LockedFlag,
+    trackedStrike: trackedStrikeSymbols,
+    trackedStrikeDepth
   };
 }
 
