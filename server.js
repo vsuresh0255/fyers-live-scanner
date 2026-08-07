@@ -125,41 +125,127 @@ function updateStateFromTick(symbol, tick) {
   if (open !== null) s.open = open;
   if (high !== null) s.high = high;
   if (low !== null) s.low = low;
-  if (ltp !== null) s.ltp = ltp;
+  if (ltp !== null) { s.ltp = ltp; updateRoundNumberCandle(symbol, ltp); }
   if (volume !== null) s.volume = volume;
   if (prevClose !== null) s.prevClose = prevClose;
 }
 
 const EPS = 0.01;
 
-// ============ 9:15 freeze pool for Gap-Neutral / Open=Low / Open=High ============
-// Per your request: whichever stocks satisfy the condition AT 9:15 become the ONLY
-// stocks ever eligible to appear for the rest of the day — they can drop OUT if they
-// stop qualifying, but no new stock can join later even if it starts qualifying after
-// 9:15. This mirrors the ORB lock pattern but freezes a SET OF SYMBOLS rather than a
-// price range.
-let openLowFrozenPool = null, openHighFrozenPool = null, gapNeutralFrozenPool = null;
-let simpleFreezeLockedFlag = false;
-let simpleFreezeDateKey = null;
+// ============ Round Number Scanner — 15-min candles, continuously live all day ============
+// A "round number" here is simply any multiple of 100 (100, 200, ..., 4500, 4600, ...) —
+// one fixed step for every stock, regardless of price range. On each 15-min candle CLOSE
+// (not every tick — this deliberately avoids flickering in/out as price ticks around),
+// checks that candle's closing price against the nearest round number. If within
+// tolerance, the stock joins the live match list with the candle's time; if a LATER
+// candle drifts back outside tolerance, it's removed — this runs continuously all day,
+// unlike the 9:21-locked screeners above.
+let roundNumberCandleState = {}; // symbol -> {bucketStart, open, high, low, close}
+let roundNumberMatches = {};     // symbol -> {roundNumber, closePrice, matchedAt}
+let roundNumberTolerancePct = 0.1; // configurable via /set-round-tolerance
+let roundNumberDateKey = null;
 
-function checkAndLockSimpleScreenerPools(){
+const ROUND_NUMBER_STEP = 100;
+
+function nearestRoundNumber(price){
+  return Math.round(price / ROUND_NUMBER_STEP) * ROUND_NUMBER_STEP;
+}
+
+function roundNumberMatchFor(price){
+  const nearest = nearestRoundNumber(price);
+  if(nearest <= 0) return null; // guards very low-priced stocks where "nearest round number" would be 0
+  const diffPct = Math.abs(price - nearest) / nearest * 100;
+  return diffPct <= roundNumberTolerancePct ? nearest : null;
+}
+
+function get15MinBucketStart(minutes){
+  return Math.floor(minutes / 15) * 15;
+}
+
+function updateRoundNumberCandle(symbol, price){
   const { dateKey, minutes } = getISTDateKeyAndMinutes();
 
-  if(simpleFreezeDateKey !== dateKey){
-    simpleFreezeDateKey = dateKey;
-    simpleFreezeLockedFlag = false;
-    openLowFrozenPool = null;
-    openHighFrozenPool = null;
-    gapNeutralFrozenPool = null;
+  if(roundNumberDateKey !== dateKey){
+    roundNumberDateKey = dateKey;
+    roundNumberCandleState = {};
+    roundNumberMatches = {};
   }
 
-  if(!simpleFreezeLockedFlag && minutes >= (9*60+15)){
+  const bucketStart = get15MinBucketStart(minutes);
+  const existing = roundNumberCandleState[symbol];
+
+  if(!existing || existing.bucketStart !== bucketStart){
+    // a new 15-min window has started — if there was a candle before this, it just
+    // closed, so evaluate IT (not the brand new one) against the round-number tolerance
+    if(existing){
+      const match = roundNumberMatchFor(existing.close);
+      if(match !== null){
+        roundNumberMatches[symbol] = {
+          roundNumber: match,
+          closePrice: existing.close,
+          matchedAt: `${String(Math.floor(existing.bucketStart/60)).padStart(2,'0')}:${String(existing.bucketStart%60).padStart(2,'0')}`,
+        };
+      } else {
+        delete roundNumberMatches[symbol]; // no longer close enough as of the latest completed candle
+      }
+    }
+    roundNumberCandleState[symbol] = { bucketStart, open: price, high: price, low: price, close: price };
+  } else {
+    existing.high = Math.max(existing.high, price);
+    existing.low = Math.min(existing.low, price);
+    existing.close = price;
+  }
+}
+
+function buildRoundNumberRows(){
+  return Object.entries(roundNumberMatches).map(([symbol, m]) => ({
+    symbol,
+    roundNumber: m.roundNumber,
+    closePrice: m.closePrice,
+    ltp: (state[symbol] && state[symbol].ltp !== null) ? state[symbol].ltp : m.closePrice,
+    matchedAt: m.matchedAt,
+  }));
+}
+
+// ============ single 9:21 scan-and-lock for Open=Low / Open=High / Gap-Neutral ============
+// At exactly this one moment, scan every stock once and lock in whichever ones satisfy
+// each condition — that becomes the permanent result for the rest of the trading day.
+// No continuous re-checking afterward: a stock that matched at 9:21 stays on the list
+// even if it stops matching later, and nothing new can join after this point. Only the
+// LTP shown for these locked stocks keeps refreshing live, since that's just useful
+// reference info and doesn't require re-scanning anything.
+//
+// Change this one value to move the scan time (currently 9:21 AM IST):
+const SCREENER_SCAN_TIME_MINUTES = 9 * 60 + 21;
+
+let screenerScanResults = { openlow: null, openhigh: null, gapneutral: null }; // null until scanned today
+let screenerScanDone = false;
+let screenerScanDateKey = null;
+let screenerScanTimestamp = null; // time label (e.g. "09:21") for display — may be later than
+                                   // the target time if the server started late that day
+
+function checkAndRunScreenerScan(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(screenerScanDateKey !== dateKey){
+    screenerScanDateKey = dateKey;
+    screenerScanDone = false;
+    screenerScanResults = { openlow: null, openhigh: null, gapneutral: null };
+    screenerScanTimestamp = null;
+  }
+
+  // fires at the target time on a normal day; also fires immediately if the server is
+  // started (or reconnects) late and today's scan hasn't happened yet — better to scan
+  // late using current state than to never scan at all
+  if(!screenerScanDone && minutes >= SCREENER_SCAN_TIME_MINUTES){
     const snap = computeScreenersUnrestricted();
-    openLowFrozenPool = new Set(snap.openEqLow.map(r => r.symbol));
-    openHighFrozenPool = new Set(snap.openEqHigh.map(r => r.symbol));
-    gapNeutralFrozenPool = new Set(snap.gapNeutral.map(r => r.symbol));
-    simpleFreezeLockedFlag = true;
-    console.log(`9:15 freeze pool locked — Open=Low: ${openLowFrozenPool.size}, Open=High: ${openHighFrozenPool.size}, Gap-Neutral: ${gapNeutralFrozenPool.size} symbols.`);
+    screenerScanResults.openlow = snap.openEqLow;
+    screenerScanResults.openhigh = snap.openEqHigh;
+    screenerScanResults.gapneutral = snap.gapNeutral;
+    screenerScanDone = true;
+    screenerScanTimestamp = timeLabel();
+    console.log(`Screener scan locked at ${screenerScanTimestamp} — Open=Low: ${screenerScanResults.openlow.length}, Open=High: ${screenerScanResults.openhigh.length}, Gap-Neutral: ${screenerScanResults.gapneutral.length} symbols.`);
+    saveScreenerScanResults();
   }
 }
 
@@ -175,16 +261,22 @@ function computeScreenersUnrestricted() {
   return { openEqLow, openEqHigh, gapNeutral };
 }
 
-function computeScreeners() {
-  const unrestricted = computeScreenersUnrestricted();
+// builds the "Right Now" rows for a locked screener: same frozen open/low/high/prevClose
+// from the moment of the scan, but ltp refreshed against current live state
+function buildLockedScreenerRows(key){
+  const frozen = screenerScanResults[key];
+  if(!frozen) return [];
+  return frozen.map(r => ({
+    ...r,
+    ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
+    matchedAt: screenerScanTimestamp,
+  }));
+}
 
-  // once the 9:15 pool is locked, restrict "Right Now" results to ONLY symbols that
-  // were in the original frozen pool — before 9:15, nothing is locked yet, so show
-  // everything currently qualifying (matches the old, unrestricted behavior for the
-  // few minutes before the freeze point)
-  const openEqLow = openLowFrozenPool ? unrestricted.openEqLow.filter(r => openLowFrozenPool.has(r.symbol)) : unrestricted.openEqLow;
-  const openEqHigh = openHighFrozenPool ? unrestricted.openEqHigh.filter(r => openHighFrozenPool.has(r.symbol)) : unrestricted.openEqHigh;
-  const gapNeutral = gapNeutralFrozenPool ? unrestricted.gapNeutral.filter(r => gapNeutralFrozenPool.has(r.symbol)) : unrestricted.gapNeutral;
+function computeScreeners() {
+  const openEqLow = buildLockedScreenerRows('openlow');
+  const openEqHigh = buildLockedScreenerRows('openhigh');
+  const gapNeutral = buildLockedScreenerRows('gapneutral');
 
   const withVolume = Object.entries(state).filter(([, s]) => s.volume !== null).map(([symbol, s]) => ({ symbol, volume: s.volume, ltp: s.ltp }));
   withVolume.sort((a, b) => b.volume - a.volume);
@@ -255,6 +347,42 @@ function savePersistedHistory(){
 }
 
 loadPersistedHistory();
+
+// ============ persistence for the 9:21 screener scan (survives Railway redeploys) ============
+const SCREENER_SCAN_PERSIST_FILE = path.join(PERSIST_DIR, 'screener_scan.json');
+
+function loadScreenerScanResults(){
+  try{
+    if(!fs.existsSync(SCREENER_SCAN_PERSIST_FILE)) {
+      console.log('No persisted screener scan found — will run fresh today.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(SCREENER_SCAN_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted screener scan is from a previous day — will run fresh today.');
+      return;
+    }
+    screenerScanResults = saved.screenerScanResults;
+    screenerScanDone = saved.screenerScanDone;
+    screenerScanDateKey = saved.date;
+    screenerScanTimestamp = saved.screenerScanTimestamp;
+    console.log(`Restored today's screener scan from disk (locked at ${screenerScanTimestamp}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted screener scan (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveScreenerScanResults(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), screenerScanResults, screenerScanDone, screenerScanTimestamp };
+    fs.writeFileSync(SCREENER_SCAN_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save screener scan to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadScreenerScanResults();
 
 function timeLabel(){
   // Date.now()/getTime() is ALWAYS an absolute UTC timestamp, completely independent of
@@ -337,7 +465,7 @@ let lastKnownDateKey = null; // tracks the day slotHistory currently belongs to,
 
 function recordMinuteSlot(){
   checkAndLockOpeningRanges();
-  checkAndLockSimpleScreenerPools();
+  checkAndRunScreenerScan();
 
   // detect a day rollover DURING ongoing operation — without this, a server that stays
   // running overnight (rather than restarting) never re-checks the date, so slotHistory
@@ -350,11 +478,13 @@ function recordMinuteSlot(){
   }
   lastKnownDateKey = currentDateKey;
 
-  const snap = computeScreeners();
+  // Open=Low / Open=High / Gap-Neutral no longer use this minute-by-minute mechanism —
+  // see checkAndRunScreenerScan() above, which locks all three in a single scan at
+  // SCREENER_SCAN_TIME_MINUTES. Only ORB breakouts still use per-minute slot tracking,
+  // since those genuinely can produce new breakouts at any point during the day.
   const orb5 = computeOrbBreakouts(5);
   const orb15 = computeOrbBreakouts(15);
   const groups = {
-    openlow: snap.openEqLow, openhigh: snap.openEqHigh, gapneutral: snap.gapNeutral,
     orb5up: orb5.up, orb5down: orb5.down, orb15up: orb15.up, orb15down: orb15.down
   };
   const label = timeLabel();
@@ -364,9 +494,6 @@ function recordMinuteSlot(){
       .map(r => r.symbol)
       .filter(sym => !alreadySeen[key].has(sym));
     freshSymbols.forEach(sym => alreadySeen[key].add(sym));
-    // always record this minute, even with an empty list — so you can see time actually
-    // progressing (9:15, 9:16, 9:17...) rather than the table looking "stuck" whenever
-    // nothing new happens to qualify that particular minute
     slotHistory[key].push({ time: label, symbols: freshSymbols });
   });
 
@@ -738,6 +865,31 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/set-round-tolerance' && req.method === 'POST') {
+    if (parsed.query.token !== RELAY_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid token' }));
+      return;
+    }
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const { tolerancePct } = JSON.parse(body);
+        const val = parseFloat(tolerancePct);
+        if (!(val > 0) || val > 10) throw new Error('tolerancePct must be a positive number, 10 or less');
+        roundNumberTolerancePct = val;
+        console.log(`Round-number tolerance changed to ${val}%`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ tolerancePct: val }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -750,9 +902,11 @@ function buildPayload(){
   return {
     ...computeScreeners(),
     slotHistory,
+    screenerScanDone, screenerScanTimestamp, screenerScanTimeTarget: SCREENER_SCAN_TIME_MINUTES,
     orb5Up: orb5.up, orb5Down: orb5.down,
     orb15Up: orb15.up, orb15Down: orb15.down,
     orb5Locked: orb5LockedFlag, orb15Locked: orb15LockedFlag,
+    roundNumberMatches: buildRoundNumberRows(), roundNumberTolerancePct,
     trackedStrike: trackedStrikeSymbols,
     trackedStrikeDepth
   };
