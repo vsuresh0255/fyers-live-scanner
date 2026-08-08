@@ -254,8 +254,39 @@ function computeScreenersUnrestricted() {
   Object.keys(state).forEach(symbol => {
     const s = state[symbol];
     if (s.open === null || s.high === null || s.low === null) return;
-    if (Math.abs(s.low - s.open) <= EPS) openEqLow.push({ symbol, open: s.open, low: s.low, ltp: s.ltp });
-    if (Math.abs(s.high - s.open) <= EPS) openEqHigh.push({ symbol, open: s.open, high: s.high, ltp: s.ltp });
+
+    // Open=Low: first 5-min candle's open equals its own low (price never dipped below
+    // the open during the first 5 minutes) AND that candle's close is already above
+    // yesterday's full-day high — reuses the same first5MinLocked/yesterdaySnapshot data
+    // built for the Early Exhaustion/Early Bottom screeners, evaluated the same way (only
+    // meaningful once the first candle has locked at 9:20, and only if yesterday's
+    // snapshot exists — both null-safe here, correctly yields no match until then)
+    const first5Min = first5MinLocked[symbol];
+    const yest = yesterdaySnapshot[symbol];
+    if (first5Min && yest) {
+      const openEqualsFirst5MinLow = Math.abs(s.open - first5Min.low) <= EPS;
+      const closedAboveYesterdayHigh = first5Min.close > yest.dayHigh;
+      if (openEqualsFirst5MinLow && closedAboveYesterdayHigh) {
+        openEqLow.push({
+          symbol, first5MinOpen: s.open, first5MinLow: first5Min.low,
+          first5MinClose: first5Min.close, yesterdayHigh: yest.dayHigh, ltp: s.ltp,
+        });
+      }
+    }
+
+    // Open=High: mirror of the above — first 5-min candle's open equals its own high
+    // (price never rose above the open during the first 5 minutes) AND that candle's
+    // close is already below yesterday's full-day low
+    if (first5Min && yest) {
+      const openEqualsFirst5MinHigh = Math.abs(s.open - first5Min.high) <= EPS;
+      const closedBelowYesterdayLow = first5Min.close < yest.dayLow;
+      if (openEqualsFirst5MinHigh && closedBelowYesterdayLow) {
+        openEqHigh.push({
+          symbol, first5MinOpen: s.open, first5MinHigh: first5Min.high,
+          first5MinClose: first5Min.close, yesterdayLow: yest.dayLow, ltp: s.ltp,
+        });
+      }
+    }
     if (s.prevClose !== null && Math.abs(s.open - s.prevClose) <= EPS) gapNeutral.push({ symbol, open: s.open, prevClose: s.prevClose, ltp: s.ltp });
   });
   return { openEqLow, openEqHigh, gapNeutral };
@@ -270,6 +301,360 @@ function buildLockedScreenerRows(key){
     ...r,
     ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
     matchedAt: screenerScanTimestamp,
+  }));
+}
+
+// ============ Early Exhaustion Breakdown screener ============
+// Pattern: yesterday's first 5-min candle (9:15-9:20) high WAS yesterday's full-day high
+// (stock made its high immediately, then faded all day) — AND today's first 5-min candle
+// high is ALSO today's high so far (the same early-exhaustion pattern repeating) — AND
+// today's first-5-min candle closed BELOW yesterday's full-day low (already broken down
+// through yesterday's entire range within the first 5 minutes). Locks once at 9:21, same
+// as the other three simple screeners.
+//
+// This needs "yesterday's" data, which nothing else in this file tracks — so this section
+// builds its own overnight-persistent snapshot: at 9:20 sharp, lock each stock's first-5-min
+// high/close from the live feed itself (no bhavcopy or other external file needed); at
+// market close (3:30 PM), save that alongside the day's final high/low as "yesterday's
+// snapshot" for tomorrow, persisted to disk so it survives a Railway restart overnight.
+const FIRST_5MIN_LOCK_MINUTES = 9 * 60 + 20;
+const EOD_SNAPSHOT_MINUTES = 15 * 60 + 30;
+
+let first5MinLocked = {};      // symbol -> {high, close} from today's 9:15-9:20 candle
+let first5MinLockedFlag = false;
+let first5MinDateKey = null;
+
+let yesterdaySnapshot = {};    // symbol -> {first5MinHigh, dayHigh, dayLow} — survives overnight
+let eodSnapshotSavedToday = false;
+let eodSnapshotDateKey = null;
+
+let earlyExhaustionResults = null; // locked at 9:21, same pattern as the other 3 screeners
+let earlyExhaustionScanDone = false;
+let earlyExhaustionScanTimestamp = null;
+let earlyExhaustionDateKey = null;
+
+function checkAndLockFirst5MinCandle(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(first5MinDateKey !== dateKey){
+    first5MinDateKey = dateKey;
+    first5MinLockedFlag = false;
+    first5MinLocked = {};
+  }
+  if(!first5MinLockedFlag && minutes >= FIRST_5MIN_LOCK_MINUTES){
+    Object.keys(state).forEach(symbol => {
+      const s = state[symbol];
+      if(s.high !== null && s.low !== null && s.ltp !== null) first5MinLocked[symbol] = { high: s.high, low: s.low, close: s.ltp };
+    });
+    first5MinLockedFlag = true;
+    console.log(`First-5-min candle locked for ${Object.keys(first5MinLocked).length} symbols.`);
+  }
+}
+
+function checkAndSaveEODSnapshot(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(eodSnapshotDateKey !== dateKey){
+    eodSnapshotDateKey = dateKey;
+    eodSnapshotSavedToday = false;
+  }
+  if(!eodSnapshotSavedToday && minutes >= EOD_SNAPSHOT_MINUTES){
+    let count = 0;
+    Object.keys(state).forEach(symbol => {
+      const s = state[symbol];
+      const locked = first5MinLocked[symbol];
+      if(locked && s.high !== null && s.low !== null){
+        yesterdaySnapshot[symbol] = { first5MinHigh: locked.high, first5MinLow: locked.low, dayHigh: s.high, dayLow: s.low };
+        count++;
+      }
+    });
+    eodSnapshotSavedToday = true;
+    console.log(`End-of-day snapshot saved for ${count} symbols — will be tomorrow's "yesterday" data.`);
+    saveYesterdaySnapshot();
+  }
+}
+
+function checkAndRunEarlyExhaustionScan(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(earlyExhaustionDateKey !== dateKey){
+    earlyExhaustionDateKey = dateKey;
+    earlyExhaustionScanDone = false;
+    earlyExhaustionResults = null;
+    earlyExhaustionScanTimestamp = null;
+  }
+  if(!earlyExhaustionScanDone && minutes >= SCREENER_SCAN_TIME_MINUTES){
+    const matches = [];
+    Object.keys(first5MinLocked).forEach(symbol => {
+      const today = first5MinLocked[symbol];
+      const s = state[symbol];
+      const yest = yesterdaySnapshot[symbol];
+      if(!yest || !s || s.high === null) return;
+
+      const yesterdayEarlyHighWasDayHigh = Math.abs(yest.first5MinHigh - yest.dayHigh) <= EPS;
+      const todayEarlyHighIsStillTodaysHigh = Math.abs(today.high - s.high) <= EPS;
+      const todayClosedBelowYesterdayLow = today.close < yest.dayLow;
+
+      if(yesterdayEarlyHighWasDayHigh && todayEarlyHighIsStillTodaysHigh && todayClosedBelowYesterdayLow){
+        matches.push({ symbol, first5MinHigh: today.high, first5MinClose: today.close, yesterdayLow: yest.dayLow, ltp: s.ltp });
+      }
+    });
+    earlyExhaustionResults = matches;
+    earlyExhaustionScanDone = true;
+    earlyExhaustionScanTimestamp = timeLabel();
+    console.log(`Early Exhaustion Breakdown scan locked at ${earlyExhaustionScanTimestamp} — ${matches.length} matches.`);
+    saveEarlyExhaustionResults();
+  }
+}
+
+function buildEarlyExhaustionRows(){
+  if(!earlyExhaustionResults) return [];
+  return earlyExhaustionResults.map(r => ({
+    ...r,
+    ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
+    matchedAt: earlyExhaustionScanTimestamp,
+  }));
+}
+
+// ============ Early Bottom Breakout screener (bullish mirror of the above) ============
+// Pattern: yesterday's first 5-min candle low WAS yesterday's full-day low (stock bottomed
+// immediately, then rallied all day) — AND today's first 5-min candle low is ALSO today's
+// low so far (same early-bottom pattern repeating) — AND today's first-5-min candle closed
+// ABOVE yesterday's full-day high (already broken out above yesterday's entire range within
+// the first 5 minutes). Reuses the exact same first5MinLocked/yesterdaySnapshot data captured
+// above (both already track high AND low), just evaluated with the mirrored condition —
+// locks separately at 9:21, same as its bearish counterpart.
+let earlyBottomResults = null;
+let earlyBottomScanDone = false;
+let earlyBottomScanTimestamp = null;
+let earlyBottomDateKey = null;
+
+function checkAndRunEarlyBottomScan(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(earlyBottomDateKey !== dateKey){
+    earlyBottomDateKey = dateKey;
+    earlyBottomScanDone = false;
+    earlyBottomResults = null;
+    earlyBottomScanTimestamp = null;
+  }
+  if(!earlyBottomScanDone && minutes >= SCREENER_SCAN_TIME_MINUTES){
+    const matches = [];
+    Object.keys(first5MinLocked).forEach(symbol => {
+      const today = first5MinLocked[symbol];
+      const s = state[symbol];
+      const yest = yesterdaySnapshot[symbol];
+      if(!yest || !s || s.low === null || yest.first5MinLow === undefined) return;
+
+      const yesterdayEarlyLowWasDayLow = Math.abs(yest.first5MinLow - yest.dayLow) <= EPS;
+      const todayEarlyLowIsStillTodaysLow = Math.abs(today.low - s.low) <= EPS;
+      const todayClosedAboveYesterdayHigh = today.close > yest.dayHigh;
+
+      if(yesterdayEarlyLowWasDayLow && todayEarlyLowIsStillTodaysLow && todayClosedAboveYesterdayHigh){
+        matches.push({ symbol, first5MinLow: today.low, first5MinClose: today.close, yesterdayHigh: yest.dayHigh, ltp: s.ltp });
+      }
+    });
+    earlyBottomResults = matches;
+    earlyBottomScanDone = true;
+    earlyBottomScanTimestamp = timeLabel();
+    console.log(`Early Bottom Breakout scan locked at ${earlyBottomScanTimestamp} — ${matches.length} matches.`);
+    saveEarlyBottomResults();
+  }
+}
+
+function buildEarlyBottomRows(){
+  if(!earlyBottomResults) return [];
+  return earlyBottomResults.map(r => ({
+    ...r,
+    ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
+    matchedAt: earlyBottomScanTimestamp,
+  }));
+}
+
+// ============ Camarilla R4/S4 Breakout screener ============
+// Buy: first 5-min candle's close is above yesterday's Camarilla R4 level.
+// Sell: first 5-min candle's close is below yesterday's Camarilla S4 level.
+// R4/S4 use the exact same formula as shared.js's computeCamarilla(), computed from
+// yesterday's High/Low (from the same yesterdaySnapshot already built for the other
+// screeners) and yesterday's Close (Fyers already sends this live as prevClose — no
+// separate tracking needed for that piece). Locked once at 9:21, same as the others.
+// The live highlighting (LTP still above R4 / below S4) is a frontend-only concern —
+// the backend just needs to keep sending the fixed r4/s4 threshold alongside live LTP.
+function computeCamarilla(h, l, c){
+  const rng = h - l;
+  return {
+    r4: c + rng * 1.1 / 2,
+    r3: c + rng * 1.1 / 4,
+    s3: c - rng * 1.1 / 4,
+    s4: c - rng * 1.1 / 2,
+  };
+}
+
+let camarillaBuyResults = null;
+let camarillaSellResults = null;
+let camarillaScanDone = false;
+let camarillaScanTimestamp = null;
+let camarillaDateKey = null;
+
+function checkAndRunCamarillaScan(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(camarillaDateKey !== dateKey){
+    camarillaDateKey = dateKey;
+    camarillaScanDone = false;
+    camarillaBuyResults = null;
+    camarillaSellResults = null;
+    camarillaScanTimestamp = null;
+  }
+  if(!camarillaScanDone && minutes >= SCREENER_SCAN_TIME_MINUTES){
+    const buys = [], sells = [];
+    Object.keys(first5MinLocked).forEach(symbol => {
+      const today = first5MinLocked[symbol];
+      const s = state[symbol];
+      const yest = yesterdaySnapshot[symbol];
+      if(!yest || !s || s.prevClose === null) return;
+
+      const cam = computeCamarilla(yest.dayHigh, yest.dayLow, s.prevClose);
+      if(today.close > cam.r4){
+        buys.push({ symbol, first5MinClose: today.close, r4: cam.r4, ltp: s.ltp });
+      } else if(today.close < cam.s4){
+        sells.push({ symbol, first5MinClose: today.close, s4: cam.s4, ltp: s.ltp });
+      }
+    });
+    camarillaBuyResults = buys;
+    camarillaSellResults = sells;
+    camarillaScanDone = true;
+    camarillaScanTimestamp = timeLabel();
+    console.log(`Camarilla R4/S4 scan locked at ${camarillaScanTimestamp} — ${buys.length} buy, ${sells.length} sell matches.`);
+    saveCamarillaResults();
+  }
+}
+
+function buildCamarillaBuyRows(){
+  if(!camarillaBuyResults) return [];
+  return camarillaBuyResults.map(r => ({
+    ...r,
+    ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
+    matchedAt: camarillaScanTimestamp,
+  }));
+}
+
+function buildCamarillaSellRows(){
+  if(!camarillaSellResults) return [];
+  return camarillaSellResults.map(r => ({
+    ...r,
+    ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
+    matchedAt: camarillaScanTimestamp,
+  }));
+}
+
+// ============ Narrow CPR screener ============
+// Standard Central Pivot Range, computed purely from yesterday's High/Low/Close (same
+// data source as the Camarilla screener above — no dependency on today's price action
+// at all). Locked at 9:21 for consistency with the rest of the suite, though the
+// underlying numbers are already fully determined before market open.
+function computeCPR(h, l, c){
+  const pp = (h + l + c) / 3;
+  const bc = (h + l) / 2;
+  const tc = 2 * pp - bc;
+  const widthPct = pp !== 0 ? Math.abs(tc - bc) / pp * 100 : null;
+  return { pp, bc, tc, widthPct };
+}
+
+let narrowCprTolerancePct = 0.5; // configurable via /set-cpr-tolerance
+let narrowCprResults = null;
+let narrowCprScanDone = false;
+let narrowCprScanTimestamp = null;
+let narrowCprDateKey = null;
+
+function checkAndRunNarrowCprScan(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(narrowCprDateKey !== dateKey){
+    narrowCprDateKey = dateKey;
+    narrowCprScanDone = false;
+    narrowCprResults = null;
+    narrowCprScanTimestamp = null;
+  }
+  if(!narrowCprScanDone && minutes >= SCREENER_SCAN_TIME_MINUTES){
+    const matches = [];
+    Object.keys(first5MinLocked).forEach(symbol => {
+      const yest = yesterdaySnapshot[symbol];
+      const today = first5MinLocked[symbol];
+      const s = state[symbol];
+      if(!yest || !s || s.prevClose === null) return;
+      const cpr = computeCPR(yest.dayHigh, yest.dayLow, s.prevClose);
+      if(cpr.widthPct !== null && cpr.widthPct <= narrowCprTolerancePct){
+        const direction = today.close > cpr.pp ? 'buy' : 'sell';
+        matches.push({ symbol, widthPct: cpr.widthPct, pp: cpr.pp, tc: cpr.tc, bc: cpr.bc, direction, ltp: s.ltp });
+      }
+    });
+    narrowCprResults = matches;
+    narrowCprScanDone = true;
+    narrowCprScanTimestamp = timeLabel();
+    console.log(`Narrow CPR scan locked at ${narrowCprScanTimestamp} — ${matches.length} matches at ${narrowCprTolerancePct}% cutoff.`);
+    saveNarrowCprResults();
+  }
+}
+
+function buildNarrowCprRows(){
+  if(!narrowCprResults) return [];
+  return narrowCprResults.map(r => ({
+    ...r,
+    ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
+    matchedAt: narrowCprScanTimestamp,
+  }));
+}
+
+// ============ Narrow Camarilla screener ============
+// Different from Narrow CPR: this measures yesterday's raw trading range (High-Low)
+// relative to yesterday's close — NOT where close sat within that range (which is what
+// CPR width measures). Since R4-S4 = (H-L) * 1.1, this is directly proportional to how
+// wide the Camarilla R4/S4 spread itself was — a narrow value here means genuine
+// volatility compression in yesterday's actual trading range. Same 9:21 lock pattern,
+// same configurable-tolerance UI as Narrow CPR and Round Number Scanner.
+function computeNarrowCamarillaRange(h, l, c){
+  const rangePct = c !== 0 ? Math.abs(h - l) / c * 100 : null;
+  return { rangePct };
+}
+
+let narrowCamarillaTolerancePct = 1.0; // configurable via /set-camarilla-tolerance
+let narrowCamarillaResults = null;
+let narrowCamarillaScanDone = false;
+let narrowCamarillaScanTimestamp = null;
+let narrowCamarillaDateKey = null;
+
+function checkAndRunNarrowCamarillaScan(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(narrowCamarillaDateKey !== dateKey){
+    narrowCamarillaDateKey = dateKey;
+    narrowCamarillaScanDone = false;
+    narrowCamarillaResults = null;
+    narrowCamarillaScanTimestamp = null;
+  }
+  if(!narrowCamarillaScanDone && minutes >= SCREENER_SCAN_TIME_MINUTES){
+    const matches = [];
+    Object.keys(first5MinLocked).forEach(symbol => {
+      const yest = yesterdaySnapshot[symbol];
+      const today = first5MinLocked[symbol];
+      const s = state[symbol];
+      if(!yest || !s || s.prevClose === null) return;
+      const { rangePct } = computeNarrowCamarillaRange(yest.dayHigh, yest.dayLow, s.prevClose);
+      if(rangePct !== null && rangePct <= narrowCamarillaTolerancePct){
+        const cam = computeCamarilla(yest.dayHigh, yest.dayLow, s.prevClose);
+        const pp = (yest.dayHigh + yest.dayLow + s.prevClose) / 3; // same PP formula as Narrow CPR, for consistency
+        const direction = today.close > pp ? 'buy' : 'sell';
+        matches.push({ symbol, rangePct, r4: cam.r4, s4: cam.s4, pp, direction, ltp: s.ltp });
+      }
+    });
+    narrowCamarillaResults = matches;
+    narrowCamarillaScanDone = true;
+    narrowCamarillaScanTimestamp = timeLabel();
+    console.log(`Narrow Camarilla scan locked at ${narrowCamarillaScanTimestamp} — ${matches.length} matches at ${narrowCamarillaTolerancePct}% cutoff.`);
+    saveNarrowCamarillaResults();
+  }
+}
+
+function buildNarrowCamarillaRows(){
+  if(!narrowCamarillaResults) return [];
+  return narrowCamarillaResults.map(r => ({
+    ...r,
+    ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
+    matchedAt: narrowCamarillaScanTimestamp,
   }));
 }
 
@@ -384,6 +769,186 @@ function saveScreenerScanResults(){
 
 loadScreenerScanResults();
 
+// ============ persistence for the Early Exhaustion Breakdown screener ============
+const YESTERDAY_SNAPSHOT_FILE = path.join(PERSIST_DIR, 'yesterday_snapshot.json');
+const EARLY_EXHAUSTION_PERSIST_FILE = path.join(PERSIST_DIR, 'early_exhaustion_scan.json');
+
+function loadYesterdaySnapshot(){
+  try{
+    if(!fs.existsSync(YESTERDAY_SNAPSHOT_FILE)) {
+      console.log('No saved "yesterday" snapshot found yet — Early Exhaustion Breakdown will show no matches until one full trading day has been captured (at 3:30 PM).');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(YESTERDAY_SNAPSHOT_FILE, 'utf8'));
+    // deliberately NOT checking saved.date against today here — unlike the other persisted
+    // state, this one is SUPPOSED to carry forward from a previous day, that's its entire
+    // purpose. Only discard it if it's implausibly old (e.g. server was off for a long
+    // stretch), so a genuinely stale multi-week-old snapshot doesn't silently keep matching
+    // against a "yesterday" that's actually long gone.
+    const ageDays = (new Date(todayDateKey()) - new Date(saved.date)) / (1000*60*60*24);
+    if(ageDays > 5){
+      console.log(`Saved snapshot is from ${saved.date}, ${Math.round(ageDays)} days ago — too stale to trust as "yesterday", ignoring it.`);
+      return;
+    }
+    yesterdaySnapshot = saved.yesterdaySnapshot;
+    console.log(`Restored "yesterday" snapshot from disk, dated ${saved.date} (${Object.keys(yesterdaySnapshot).length} symbols) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load yesterday snapshot (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveYesterdaySnapshot(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    fs.writeFileSync(YESTERDAY_SNAPSHOT_FILE, JSON.stringify({ date: todayDateKey(), yesterdaySnapshot }));
+  } catch(err){
+    console.log('Could not save yesterday snapshot to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+function loadEarlyExhaustionResults(){
+  try{
+    if(!fs.existsSync(EARLY_EXHAUSTION_PERSIST_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(EARLY_EXHAUSTION_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()) return; // this one DOES reset daily, same as the other 9:21 scans
+    earlyExhaustionResults = saved.earlyExhaustionResults;
+    earlyExhaustionScanDone = saved.earlyExhaustionScanDone;
+    earlyExhaustionDateKey = saved.date;
+    earlyExhaustionScanTimestamp = saved.earlyExhaustionScanTimestamp;
+    console.log(`Restored today's Early Exhaustion Breakdown scan from disk (locked at ${earlyExhaustionScanTimestamp}).`);
+  } catch(err){
+    console.log('Could not load early exhaustion scan (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveEarlyExhaustionResults(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), earlyExhaustionResults, earlyExhaustionScanDone, earlyExhaustionScanTimestamp };
+    fs.writeFileSync(EARLY_EXHAUSTION_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save early exhaustion scan to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+const EARLY_BOTTOM_PERSIST_FILE = path.join(PERSIST_DIR, 'early_bottom_scan.json');
+
+function loadEarlyBottomResults(){
+  try{
+    if(!fs.existsSync(EARLY_BOTTOM_PERSIST_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(EARLY_BOTTOM_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()) return;
+    earlyBottomResults = saved.earlyBottomResults;
+    earlyBottomScanDone = saved.earlyBottomScanDone;
+    earlyBottomDateKey = saved.date;
+    earlyBottomScanTimestamp = saved.earlyBottomScanTimestamp;
+    console.log(`Restored today's Early Bottom Breakout scan from disk (locked at ${earlyBottomScanTimestamp}).`);
+  } catch(err){
+    console.log('Could not load early bottom scan (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveEarlyBottomResults(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), earlyBottomResults, earlyBottomScanDone, earlyBottomScanTimestamp };
+    fs.writeFileSync(EARLY_BOTTOM_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save early bottom scan to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+const CAMARILLA_PERSIST_FILE = path.join(PERSIST_DIR, 'camarilla_scan.json');
+
+function loadCamarillaResults(){
+  try{
+    if(!fs.existsSync(CAMARILLA_PERSIST_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(CAMARILLA_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()) return;
+    camarillaBuyResults = saved.camarillaBuyResults;
+    camarillaSellResults = saved.camarillaSellResults;
+    camarillaScanDone = saved.camarillaScanDone;
+    camarillaDateKey = saved.date;
+    camarillaScanTimestamp = saved.camarillaScanTimestamp;
+    console.log(`Restored today's Camarilla R4/S4 scan from disk (locked at ${camarillaScanTimestamp}).`);
+  } catch(err){
+    console.log('Could not load Camarilla scan (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveCamarillaResults(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), camarillaBuyResults, camarillaSellResults, camarillaScanDone, camarillaScanTimestamp };
+    fs.writeFileSync(CAMARILLA_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save Camarilla scan to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+const NARROW_CPR_PERSIST_FILE = path.join(PERSIST_DIR, 'narrow_cpr_scan.json');
+
+function loadNarrowCprResults(){
+  try{
+    if(!fs.existsSync(NARROW_CPR_PERSIST_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(NARROW_CPR_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()) return;
+    narrowCprResults = saved.narrowCprResults;
+    narrowCprScanDone = saved.narrowCprScanDone;
+    narrowCprDateKey = saved.date;
+    narrowCprScanTimestamp = saved.narrowCprScanTimestamp;
+    if(saved.narrowCprTolerancePct !== undefined) narrowCprTolerancePct = saved.narrowCprTolerancePct;
+    console.log(`Restored today's Narrow CPR scan from disk (locked at ${narrowCprScanTimestamp}).`);
+  } catch(err){
+    console.log('Could not load Narrow CPR scan (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveNarrowCprResults(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), narrowCprResults, narrowCprScanDone, narrowCprScanTimestamp, narrowCprTolerancePct };
+    fs.writeFileSync(NARROW_CPR_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save Narrow CPR scan to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+const NARROW_CAMARILLA_PERSIST_FILE = path.join(PERSIST_DIR, 'narrow_camarilla_scan.json');
+
+function loadNarrowCamarillaResults(){
+  try{
+    if(!fs.existsSync(NARROW_CAMARILLA_PERSIST_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(NARROW_CAMARILLA_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()) return;
+    narrowCamarillaResults = saved.narrowCamarillaResults;
+    narrowCamarillaScanDone = saved.narrowCamarillaScanDone;
+    narrowCamarillaDateKey = saved.date;
+    narrowCamarillaScanTimestamp = saved.narrowCamarillaScanTimestamp;
+    if(saved.narrowCamarillaTolerancePct !== undefined) narrowCamarillaTolerancePct = saved.narrowCamarillaTolerancePct;
+    console.log(`Restored today's Narrow Camarilla scan from disk (locked at ${narrowCamarillaScanTimestamp}).`);
+  } catch(err){
+    console.log('Could not load Narrow Camarilla scan (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveNarrowCamarillaResults(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), narrowCamarillaResults, narrowCamarillaScanDone, narrowCamarillaScanTimestamp, narrowCamarillaTolerancePct };
+    fs.writeFileSync(NARROW_CAMARILLA_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save Narrow Camarilla scan to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadYesterdaySnapshot();
+loadEarlyExhaustionResults();
+loadEarlyBottomResults();
+loadCamarillaResults();
+loadNarrowCprResults();
+loadNarrowCamarillaResults();
+
 function timeLabel(){
   // Date.now()/getTime() is ALWAYS an absolute UTC timestamp, completely independent of
   // whatever the server's own local timezone happens to be set to — no need to account
@@ -466,6 +1031,13 @@ let lastKnownDateKey = null; // tracks the day slotHistory currently belongs to,
 function recordMinuteSlot(){
   checkAndLockOpeningRanges();
   checkAndRunScreenerScan();
+  checkAndLockFirst5MinCandle();
+  checkAndSaveEODSnapshot();
+  checkAndRunEarlyExhaustionScan();
+  checkAndRunEarlyBottomScan();
+  checkAndRunCamarillaScan();
+  checkAndRunNarrowCprScan();
+  checkAndRunNarrowCamarillaScan();
 
   // detect a day rollover DURING ongoing operation — without this, a server that stays
   // running overnight (rather than restarting) never re-checks the date, so slotHistory
@@ -890,6 +1462,56 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/set-cpr-tolerance' && req.method === 'POST') {
+    if (parsed.query.token !== RELAY_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid token' }));
+      return;
+    }
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const { tolerancePct } = JSON.parse(body);
+        const val = parseFloat(tolerancePct);
+        if (!(val > 0) || val > 10) throw new Error('tolerancePct must be a positive number, 10 or less');
+        narrowCprTolerancePct = val;
+        console.log(`Narrow CPR tolerance changed to ${val}%`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ tolerancePct: val }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  if (parsed.pathname === '/set-camarilla-tolerance' && req.method === 'POST') {
+    if (parsed.query.token !== RELAY_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid token' }));
+      return;
+    }
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const { tolerancePct } = JSON.parse(body);
+        const val = parseFloat(tolerancePct);
+        if (!(val > 0) || val > 10) throw new Error('tolerancePct must be a positive number, 10 or less');
+        narrowCamarillaTolerancePct = val;
+        console.log(`Narrow Camarilla tolerance changed to ${val}%`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ tolerancePct: val }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -907,6 +1529,17 @@ function buildPayload(){
     orb15Up: orb15.up, orb15Down: orb15.down,
     orb5Locked: orb5LockedFlag, orb15Locked: orb15LockedFlag,
     roundNumberMatches: buildRoundNumberRows(), roundNumberTolerancePct,
+    earlyExhaustionBreakdown: buildEarlyExhaustionRows(),
+    earlyExhaustionScanDone, earlyExhaustionScanTimestamp,
+    earlyBottomBreakout: buildEarlyBottomRows(),
+    earlyBottomScanDone, earlyBottomScanTimestamp,
+    camarillaBuy: buildCamarillaBuyRows(), camarillaSell: buildCamarillaSellRows(),
+    camarillaScanDone, camarillaScanTimestamp,
+    narrowCpr: buildNarrowCprRows(), narrowCprTolerancePct,
+    narrowCprScanDone, narrowCprScanTimestamp,
+    narrowCamarilla: buildNarrowCamarillaRows(), narrowCamarillaTolerancePct,
+    narrowCamarillaScanDone, narrowCamarillaScanTimestamp,
+    hasYesterdaySnapshot: Object.keys(yesterdaySnapshot).length > 0,
     trackedStrike: trackedStrikeSymbols,
     trackedStrikeDepth
   };
