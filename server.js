@@ -144,6 +144,8 @@ let roundNumberCandleState = {}; // symbol -> {bucketStart, open, high, low, clo
 let roundNumberMatches = {};     // symbol -> {roundNumber, closePrice, matchedAt}
 let roundNumberTolerancePct = 0.1; // configurable via /set-round-tolerance
 let roundNumberDateKey = null;
+let roundNumberHistory = [];         // running history of 15-min snapshots, newest first
+let lastRoundNumberSnapshotBucket = null; // which 15-min bucket we last took a snapshot for
 
 const ROUND_NUMBER_STEP = 100;
 
@@ -205,6 +207,25 @@ function buildRoundNumberRows(){
     ltp: (state[symbol] && state[symbol].ltp !== null) ? state[symbol].ltp : m.closePrice,
     matchedAt: m.matchedAt,
   }));
+}
+
+// Takes a snapshot of the current round-number matches once per 15-min bucket and keeps
+// a running history — separate from roundNumberMatches itself, which only ever reflects
+// the SINGLE most recent 15-min candle close per symbol (older matches are overwritten,
+// not kept). Called every minute via recordMinuteSlot() like everything else, but the
+// bucket check below means it only actually records once per 15-min window, not every
+// minute. Newest snapshot is added to the FRONT of the array (unshift), so the history
+// is already in newest-first order with no sorting needed on the browser side.
+function checkAndRecordRoundNumberSnapshot(){
+  const { minutes } = getISTDateKeyAndMinutes();
+  const bucketStart = get15MinBucketStart(minutes);
+  if(lastRoundNumberSnapshotBucket === bucketStart) return; // already recorded this window
+  lastRoundNumberSnapshotBucket = bucketStart;
+
+  const rows = buildRoundNumberRows();
+  const label = `${String(Math.floor(bucketStart/60)).padStart(2,'0')}:${String(bucketStart%60).padStart(2,'0')}`;
+  roundNumberHistory.unshift({ time: label, matches: rows });
+  saveRoundNumberHistory();
 }
 
 // ============ single 9:21 scan-and-lock for Open=Low / Open=High / Gap-Neutral ============
@@ -942,12 +963,38 @@ function saveNarrowCamarillaResults(){
   }
 }
 
+const ROUND_NUMBER_HISTORY_PERSIST_FILE = path.join(PERSIST_DIR, 'round_number_history.json');
+
+function loadRoundNumberHistory(){
+  try{
+    if(!fs.existsSync(ROUND_NUMBER_HISTORY_PERSIST_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(ROUND_NUMBER_HISTORY_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()) return;
+    roundNumberHistory = saved.roundNumberHistory || [];
+    lastRoundNumberSnapshotBucket = saved.lastRoundNumberSnapshotBucket !== undefined ? saved.lastRoundNumberSnapshotBucket : null;
+    console.log(`Restored Round Number history from disk — ${roundNumberHistory.length} snapshot(s) so far today.`);
+  } catch(err){
+    console.log('Could not load Round Number history (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveRoundNumberHistory(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), roundNumberHistory, lastRoundNumberSnapshotBucket };
+    fs.writeFileSync(ROUND_NUMBER_HISTORY_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save Round Number history to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
 loadYesterdaySnapshot();
 loadEarlyExhaustionResults();
 loadEarlyBottomResults();
 loadCamarillaResults();
 loadNarrowCprResults();
 loadNarrowCamarillaResults();
+loadRoundNumberHistory();
 
 function timeLabel(){
   // Date.now()/getTime() is ALWAYS an absolute UTC timestamp, completely independent of
@@ -1038,6 +1085,7 @@ function recordMinuteSlot(){
   checkAndRunCamarillaScan();
   checkAndRunNarrowCprScan();
   checkAndRunNarrowCamarillaScan();
+  checkAndRecordRoundNumberSnapshot();
 
   // detect a day rollover DURING ongoing operation — without this, a server that stays
   // running overnight (rather than restarting) never re-checks the date, so slotHistory
@@ -1047,6 +1095,8 @@ function recordMinuteSlot(){
     console.log(`Trading day changed (${lastKnownDateKey} -> ${currentDateKey}) — resetting slot history for the new day.`);
     Object.keys(slotHistory).forEach(key => { slotHistory[key] = []; });
     Object.keys(alreadySeen).forEach(key => { alreadySeen[key] = new Set(); });
+    roundNumberHistory = [];
+    lastRoundNumberSnapshotBucket = null;
   }
   lastKnownDateKey = currentDateKey;
 
@@ -1528,7 +1578,7 @@ function buildPayload(){
     orb5Up: orb5.up, orb5Down: orb5.down,
     orb15Up: orb15.up, orb15Down: orb15.down,
     orb5Locked: orb5LockedFlag, orb15Locked: orb15LockedFlag,
-    roundNumberMatches: buildRoundNumberRows(), roundNumberTolerancePct,
+    roundNumberMatches: buildRoundNumberRows(), roundNumberTolerancePct, roundNumberHistory,
     earlyExhaustionBreakdown: buildEarlyExhaustionRows(),
     earlyExhaustionScanDone, earlyExhaustionScanTimestamp,
     earlyBottomBreakout: buildEarlyBottomRows(),
