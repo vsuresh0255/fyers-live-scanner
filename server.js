@@ -24,6 +24,7 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const https = require('https');
 const url = require('url');
 const WebSocket = require('ws');
 // Patches a real bug in fyers-api-v3's tbtsocket/tbtSocket.js: it calls https.get()
@@ -125,7 +126,7 @@ function updateStateFromTick(symbol, tick) {
   if (open !== null) s.open = open;
   if (high !== null) s.high = high;
   if (low !== null) s.low = low;
-  if (ltp !== null) { s.ltp = ltp; updateRoundNumberCandle(symbol, ltp); }
+  if (ltp !== null) { s.ltp = ltp; updateRoundNumberCandle(symbol, ltp); updateSecondHalfTracking(symbol, ltp); }
   if (volume !== null) s.volume = volume;
   if (prevClose !== null) s.prevClose = prevClose;
 }
@@ -349,6 +350,143 @@ let yesterdaySnapshot = {};    // symbol -> {first5MinHigh, dayHigh, dayLow} —
 let eodSnapshotSavedToday = false;
 let eodSnapshotDateKey = null;
 
+// ============ Half-day (first/second 195-min half) tracking — NIFTY/BANKNIFTY/SENSEX only ============
+// First half = 9:15-12:30 (195 min from open). Second half = 12:30-3:30 (close). Each
+// display slot always shows the most recently COMPLETED version of that half — today's
+// once it locks, yesterday's persisted value until then.
+const HALF_DAY_SYMBOLS = ['NIFTY', 'BANKNIFTY', 'SENSEX'];
+const FIRST_HALF_LOCK_MINUTES = 9 * 60 + 15 + 195; // 12:30 PM
+// second half locks at EOD_SNAPSHOT_MINUTES (market close), reusing the existing constant
+
+let firstHalfLocked = {};    // symbol -> {open, high, low, close} — today's first half
+let secondHalfRunning = {};  // symbol -> {high, low} — running high/low from 12:30 PM, tick-accurate
+let secondHalfOpen = {};     // symbol -> price at 12:30 PM (second half's own open)
+let secondHalfLocked = {};   // symbol -> {open, high, low, close} — today's second half
+let yesterdayHalves = {};    // symbol -> {firstHalf:{...}, secondHalf:{...}} — persists overnight
+let halfDayDateKey = null;
+let firstHalfLockedFlag = false;
+let secondHalfLockedFlag = false;
+
+// ============ Multi-strike half-day tracking (ATM +/- 5, NIFTY/BANKNIFTY/SENSEX) ============
+// Verified column layout from Fyers' own symbol master (both NSE_FO.csv and
+// BSE_FO.csv use the identical layout): col 8 = expiry timestamp, col 9 =
+// tradable Fyers symbol, col 13 = underlying symbol, col 15 = strike price,
+// col 16 = option type ('CE'/'PE') or 'XX' for futures rows.
+const STRIKE_INTERVALS = { NIFTY: 50, BANKNIFTY: 100, SENSEX: 100 }; // current well-known convention; NSE/BSE occasionally revise these as index levels rise
+const STRIKE_TRACK_RANGE = 5; // 5 above + 5 below + ATM = 11 strikes per index
+const NSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/NSE_FO.csv';
+const BSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/BSE_FO.csv';
+
+let multiStrikeMeta = {};       // fyersSymbol -> {index, relativePos, type, strike}
+let multiStrikeSymbolList = []; // flat list of fyersSymbols currently tracked, extends HALF_DAY_SYMBOLS for locking
+let multiStrikeSelectedToday = false;
+let multiStrikeDiscoveryInProgress = false; // guards against overlapping calls while the async fetch is in flight
+let yesterdayMultiStrikeHalves = {}; // "INDEX_RELPOS_TYPE" -> {firstHalf:{...}, secondHalf:{...}} — keyed by RELATIVE position, not literal strike, since the actual strike shifts day to day
+
+function fetchUrl(targetUrl){
+  return new Promise((resolve, reject) => {
+    https.get(targetUrl, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => resolve(data));
+    }).on('error', reject);
+  });
+}
+
+function parseStrikesFromCsv(csvText, indexSymbol, atmStrike, interval){
+  if(!csvText) return {};
+  const nowTs = Date.now() / 1000;
+  const bestByKey = {}; // "strike_CE" -> {expiryTs, fyersSymbol}
+  csvText.split('\n').forEach(line => {
+    const cols = line.split(',');
+    if(cols.length < 17) return;
+    const optType = cols[16] ? cols[16].trim() : '';
+    if(optType !== 'CE' && optType !== 'PE') return;
+    const underlying = (cols[13] || '').trim().toUpperCase();
+    if(underlying !== indexSymbol) return;
+    const expiryTs = parseFloat(cols[8]);
+    const strike = parseFloat(cols[15]);
+    const fyersSymbol = (cols[9] || '').trim();
+    if(isNaN(expiryTs) || isNaN(strike) || !fyersSymbol) return;
+    if(expiryTs < nowTs) return; // already expired
+    const key = `${strike}_${optType}`;
+    if(!bestByKey[key] || expiryTs < bestByKey[key].expiryTs){
+      bestByKey[key] = { expiryTs, fyersSymbol };
+    }
+  });
+
+  const result = {};
+  for(let offset = -STRIKE_TRACK_RANGE; offset <= STRIKE_TRACK_RANGE; offset++){
+    const strike = atmStrike + offset * interval;
+    const posLabel = offset === 0 ? 'ATM' : (offset > 0 ? `ATM+${offset}` : `ATM${offset}`);
+    ['CE', 'PE'].forEach(optType => {
+      const found = bestByKey[`${strike}_${optType}`];
+      if(found){
+        result[found.fyersSymbol] = { index: indexSymbol, relativePos: posLabel, type: optType, strike };
+      }
+    });
+  }
+  return result;
+}
+
+// Runs once per day, shortly after market open once each index has a real
+// live price to compute ATM from. Fixed for the rest of the day once
+// selected, per the confirmed design — does not re-pick as ATM shifts.
+async function discoverAndSubscribeMultiStrikes(){
+  if(multiStrikeSelectedToday || multiStrikeDiscoveryInProgress) return;
+  const indices = ['NIFTY', 'BANKNIFTY', 'SENSEX'];
+  const notReady = indices.filter(sym => !state[sym] || state[sym].ltp === null);
+  if(notReady.length > 0) return; // wait quietly until all three have a live price
+
+  multiStrikeDiscoveryInProgress = true;
+  try{
+    const nseCsv = await fetchUrl(NSE_SYMBOL_MASTER_URL);
+    let bseCsv = null;
+    try{ bseCsv = await fetchUrl(BSE_SYMBOL_MASTER_URL); }
+    catch(e){ console.log('Could not fetch BSE symbol master (SENSEX strikes will be skipped):', e.message); }
+
+    let meta = {};
+    ['NIFTY', 'BANKNIFTY'].forEach(sym => {
+      const atm = Math.round(state[sym].ltp / STRIKE_INTERVALS[sym]) * STRIKE_INTERVALS[sym];
+      Object.assign(meta, parseStrikesFromCsv(nseCsv, sym, atm, STRIKE_INTERVALS[sym]));
+    });
+    if(bseCsv){
+      const atm = Math.round(state.SENSEX.ltp / STRIKE_INTERVALS.SENSEX) * STRIKE_INTERVALS.SENSEX;
+      Object.assign(meta, parseStrikesFromCsv(bseCsv, 'SENSEX', atm, STRIKE_INTERVALS.SENSEX));
+    }
+
+    multiStrikeMeta = meta;
+    multiStrikeSymbolList = Object.keys(meta);
+    multiStrikeSymbolList.forEach(sym => {
+      if(!state[sym]) state[sym] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null };
+    });
+
+    if(fyersSocket && multiStrikeSymbolList.length > 0){
+      fyersSocket.subscribe(multiStrikeSymbolList);
+      console.log(`Multi-strike tracking: subscribed to ${multiStrikeSymbolList.length} option symbols (ATM +/-${STRIKE_TRACK_RANGE}) across NIFTY/BANKNIFTY/SENSEX.`);
+    }
+    multiStrikeSelectedToday = true;
+  } catch(err){
+    console.log('Multi-strike discovery failed (will retry next minute):', err.message);
+  } finally {
+    multiStrikeDiscoveryInProgress = false;
+  }
+}
+
+// Tick-accurate — called from updateStateFromTick(), not sampled once per minute, so a
+// brief intra-minute spike during the second half isn't missed.
+function updateSecondHalfTracking(symbol, ltp){
+  if(!HALF_DAY_SYMBOLS.includes(symbol) && !multiStrikeSymbolList.includes(symbol)) return;
+  if(!firstHalfLockedFlag || secondHalfLockedFlag) return; // only between the two locks
+  if(!secondHalfRunning[symbol]){
+    secondHalfRunning[symbol] = { high: ltp, low: ltp };
+  } else {
+    if(ltp > secondHalfRunning[symbol].high) secondHalfRunning[symbol].high = ltp;
+    if(ltp < secondHalfRunning[symbol].low) secondHalfRunning[symbol].low = ltp;
+  }
+}
+
+
 let earlyExhaustionResults = null; // locked at 9:21, same pattern as the other 3 screeners
 let earlyExhaustionScanDone = false;
 let earlyExhaustionScanTimestamp = null;
@@ -364,7 +502,7 @@ function checkAndLockFirst5MinCandle(){
   if(!first5MinLockedFlag && minutes >= FIRST_5MIN_LOCK_MINUTES){
     Object.keys(state).forEach(symbol => {
       const s = state[symbol];
-      if(s.high !== null && s.low !== null && s.ltp !== null) first5MinLocked[symbol] = { high: s.high, low: s.low, close: s.ltp };
+      if(s.high !== null && s.low !== null && s.ltp !== null && s.open !== null) first5MinLocked[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
     });
     first5MinLockedFlag = true;
     console.log(`First-5-min candle locked for ${Object.keys(first5MinLocked).length} symbols.`);
@@ -390,6 +528,106 @@ function checkAndSaveEODSnapshot(){
     eodSnapshotSavedToday = true;
     console.log(`End-of-day snapshot saved for ${count} symbols — will be tomorrow's "yesterday" data.`);
     saveYesterdaySnapshot();
+  }
+}
+
+function checkAndLockFirstHalf(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(halfDayDateKey !== dateKey){
+    // new day — roll TODAY's now-completed halves into yesterdayHalves before resetting,
+    // so the display has something to fall back to until today's own halves complete.
+    // Also gates the multi-strike reset — without this same guard, the FIRST-EVER call
+    // to this function in a fresh process (halfDayDateKey starts as null) would look
+    // identical to a genuine day change, wiping out multi-strike symbols that
+    // discoverAndSubscribeMultiStrikes() may have JUST found earlier in this same
+    // minute (it runs first in recordMinuteSlot()). This would fire on every single
+    // server restart, not just real day rollovers — a real bug caught in testing.
+    if(halfDayDateKey !== null){
+      HALF_DAY_SYMBOLS.forEach(symbol => {
+        if(firstHalfLocked[symbol] || secondHalfLocked[symbol]){
+          yesterdayHalves[symbol] = {
+            firstHalf: firstHalfLocked[symbol] || (yesterdayHalves[symbol] && yesterdayHalves[symbol].firstHalf) || null,
+            secondHalf: secondHalfLocked[symbol] || (yesterdayHalves[symbol] && yesterdayHalves[symbol].secondHalf) || null,
+          };
+        }
+      });
+      rollMultiStrikeIntoYesterday();
+      saveYesterdayHalves();
+      saveYesterdayMultiStrikeHalves();
+      // multi-strike selection resets ONLY on a genuine day change — ATM likely shifted
+      multiStrikeSelectedToday = false;
+      multiStrikeMeta = {};
+      multiStrikeSymbolList = [];
+    }
+    halfDayDateKey = dateKey;
+    firstHalfLockedFlag = false;
+    secondHalfLockedFlag = false;
+    firstHalfLocked = {};
+    secondHalfLocked = {};
+    secondHalfRunning = {};
+    secondHalfOpen = {};
+  }
+  if(!firstHalfLockedFlag && minutes >= FIRST_HALF_LOCK_MINUTES){
+    const allSymbols = [...HALF_DAY_SYMBOLS, ...multiStrikeSymbolList];
+    allSymbols.forEach(symbol => {
+      const s = state[symbol];
+      if(s && s.open !== null && s.high !== null && s.low !== null && s.ltp !== null){
+        firstHalfLocked[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
+        secondHalfOpen[symbol] = s.ltp; // second half's own open = first half's close
+        secondHalfRunning[symbol] = { high: s.ltp, low: s.ltp }; // seed the second-half tracker
+      }
+    });
+    firstHalfLockedFlag = true;
+    console.log(`First-half (9:15-12:30) locked for ${Object.keys(firstHalfLocked).length} symbol(s) (indices + ${multiStrikeSymbolList.length} tracked strikes).`);
+  }
+}
+
+// Rolls today's locked multi-strike data into yesterdayMultiStrikeHalves, keyed
+// by RELATIVE position ("NIFTY_ATM+2_CE") rather than the literal Fyers symbol —
+// today's ATM+2 is very likely a different actual strike than tomorrow's ATM+2,
+// but the relative-position comparison is what's meaningful across days.
+function rollMultiStrikeIntoYesterday(){
+  multiStrikeSymbolList.forEach(symbol => {
+    const meta = multiStrikeMeta[symbol];
+    if(!meta) return;
+    if(firstHalfLocked[symbol] || secondHalfLocked[symbol]){
+      const key = `${meta.index}_${meta.relativePos}_${meta.type}`;
+      yesterdayMultiStrikeHalves[key] = {
+        firstHalf: firstHalfLocked[symbol] || (yesterdayMultiStrikeHalves[key] && yesterdayMultiStrikeHalves[key].firstHalf) || null,
+        secondHalf: secondHalfLocked[symbol] || (yesterdayMultiStrikeHalves[key] && yesterdayMultiStrikeHalves[key].secondHalf) || null,
+      };
+    }
+  });
+}
+
+function checkAndLockSecondHalf(){
+  const { minutes } = getISTDateKeyAndMinutes();
+  if(!firstHalfLockedFlag || secondHalfLockedFlag) return;
+  if(minutes >= EOD_SNAPSHOT_MINUTES){
+    const allSymbols = [...HALF_DAY_SYMBOLS, ...multiStrikeSymbolList];
+    allSymbols.forEach(symbol => {
+      const s = state[symbol];
+      const running = secondHalfRunning[symbol];
+      const openPrice = secondHalfOpen[symbol];
+      if(s && running && openPrice !== undefined && s.ltp !== null){
+        secondHalfLocked[symbol] = { open: openPrice, high: running.high, low: running.low, close: s.ltp };
+      }
+    });
+    secondHalfLockedFlag = true;
+    console.log(`Second-half (12:30-3:30) locked for ${Object.keys(secondHalfLocked).length} symbol(s).`);
+    // roll today's completed halves into yesterday* immediately (not waiting for
+    // tomorrow's date-change) so a restart tonight doesn't lose today's second half
+    HALF_DAY_SYMBOLS.forEach(symbol => {
+      if(firstHalfLocked[symbol] || secondHalfLocked[symbol]){
+        yesterdayHalves[symbol] = {
+          firstHalf: firstHalfLocked[symbol] || (yesterdayHalves[symbol] && yesterdayHalves[symbol].firstHalf) || null,
+          secondHalf: secondHalfLocked[symbol] || (yesterdayHalves[symbol] && yesterdayHalves[symbol].secondHalf) || null,
+        };
+      }
+    });
+    rollMultiStrikeIntoYesterday();
+    saveYesterdayHalves();
+    saveYesterdayMultiStrikeHalves();
   }
 }
 
@@ -827,6 +1065,68 @@ function saveYesterdaySnapshot(){
   }
 }
 
+const YESTERDAY_HALVES_FILE = path.join(PERSIST_DIR, 'yesterday_halves.json');
+
+function loadYesterdayHalves(){
+  try{
+    if(!fs.existsSync(YESTERDAY_HALVES_FILE)){
+      console.log('No saved half-day snapshot found yet — First/Second Half panels will show no data until one full trading day has been captured.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(YESTERDAY_HALVES_FILE, 'utf8'));
+    // same staleness tolerance as yesterdaySnapshot — carries forward across a normal
+    // weekend/holiday gap, but not an implausibly long one
+    const ageDays = (new Date(todayDateKey()) - new Date(saved.date)) / (1000*60*60*24);
+    if(ageDays > 5){
+      console.log(`Saved half-day snapshot is from ${saved.date}, ${Math.round(ageDays)} days ago — too stale, ignoring it.`);
+      return;
+    }
+    yesterdayHalves = saved.yesterdayHalves;
+    console.log(`Restored half-day snapshot from disk, dated ${saved.date} — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load half-day snapshot (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveYesterdayHalves(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    fs.writeFileSync(YESTERDAY_HALVES_FILE, JSON.stringify({ date: todayDateKey(), yesterdayHalves }));
+  } catch(err){
+    console.log('Could not save half-day snapshot to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+const YESTERDAY_MULTI_STRIKE_HALVES_FILE = path.join(PERSIST_DIR, 'yesterday_multistrike_halves.json');
+
+function loadYesterdayMultiStrikeHalves(){
+  try{
+    if(!fs.existsSync(YESTERDAY_MULTI_STRIKE_HALVES_FILE)){
+      console.log('No saved multi-strike half-day snapshot found yet.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(YESTERDAY_MULTI_STRIKE_HALVES_FILE, 'utf8'));
+    const ageDays = (new Date(todayDateKey()) - new Date(saved.date)) / (1000*60*60*24);
+    if(ageDays > 5){
+      console.log(`Saved multi-strike half-day snapshot is from ${saved.date}, ${Math.round(ageDays)} days ago — too stale, ignoring it.`);
+      return;
+    }
+    yesterdayMultiStrikeHalves = saved.yesterdayMultiStrikeHalves;
+    console.log(`Restored multi-strike half-day snapshot from disk, dated ${saved.date} — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load multi-strike half-day snapshot (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveYesterdayMultiStrikeHalves(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    fs.writeFileSync(YESTERDAY_MULTI_STRIKE_HALVES_FILE, JSON.stringify({ date: todayDateKey(), yesterdayMultiStrikeHalves }));
+  } catch(err){
+    console.log('Could not save multi-strike half-day snapshot to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
 function loadEarlyExhaustionResults(){
   try{
     if(!fs.existsSync(EARLY_EXHAUSTION_PERSIST_FILE)) return;
@@ -995,6 +1295,8 @@ loadCamarillaResults();
 loadNarrowCprResults();
 loadNarrowCamarillaResults();
 loadRoundNumberHistory();
+loadYesterdayHalves();
+loadYesterdayMultiStrikeHalves();
 
 function timeLabel(){
   // Date.now()/getTime() is ALWAYS an absolute UTC timestamp, completely independent of
@@ -1086,6 +1388,9 @@ function recordMinuteSlot(){
   checkAndRunNarrowCprScan();
   checkAndRunNarrowCamarillaScan();
   checkAndRecordRoundNumberSnapshot();
+  checkAndLockFirstHalf();
+  discoverAndSubscribeMultiStrikes();
+  checkAndLockSecondHalf();
 
   // detect a day rollover DURING ongoing operation — without this, a server that stays
   // running overnight (rather than restarting) never re-checks the date, so slotHistory
@@ -1568,6 +1873,62 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocket.Server({ server, path: '/live' });
 
+// For each symbol, resolves what should actually be DISPLAYED for each half right
+// now: today's own locked value once it's available, falling back to yesterday's
+// persisted value until then. This fallback logic lives server-side so every
+// connected page just displays whatever it receives, rather than each page
+// re-implementing the same "which value wins" decision independently.
+function buildHalfDayLevels(){
+  const result = {};
+  HALF_DAY_SYMBOLS.forEach(symbol => {
+    const yFirst = yesterdayHalves[symbol] && yesterdayHalves[symbol].firstHalf;
+    const ySecond = yesterdayHalves[symbol] && yesterdayHalves[symbol].secondHalf;
+    result[symbol] = {
+      firstHalf: firstHalfLocked[symbol] || yFirst || null,
+      firstHalfIsToday: !!firstHalfLocked[symbol],
+      secondHalf: secondHalfLocked[symbol] || ySecond || null,
+      secondHalfIsToday: !!secondHalfLocked[symbol],
+    };
+  });
+  return result;
+}
+
+// Builds one row per (index, relative position, type), sorted ATM-5 through
+// ATM+5 for clean table rendering — {NIFTY: [...11 rows CE + 11 rows PE...], ...}
+const RELATIVE_POS_ORDER = [-5,-4,-3,-2,-1,0,1,2,3,4,5].map(n => n === 0 ? 'ATM' : (n > 0 ? `ATM+${n}` : `ATM${n}`));
+
+function buildMultiStrikeHalfDayLevels(){
+  const result = { NIFTY: [], BANKNIFTY: [], SENSEX: [] };
+  const bySymbol = {}; // "INDEX_RELPOS_TYPE" -> {strike, firstHalf, firstHalfIsToday, secondHalf, secondHalfIsToday}
+
+  multiStrikeSymbolList.forEach(symbol => {
+    const meta = multiStrikeMeta[symbol];
+    if(!meta) return;
+    const key = `${meta.index}_${meta.relativePos}_${meta.type}`;
+    const yData = yesterdayMultiStrikeHalves[key];
+    bySymbol[key] = {
+      index: meta.index, relativePos: meta.relativePos, type: meta.type, strike: meta.strike,
+      firstHalf: firstHalfLocked[symbol] || (yData && yData.firstHalf) || null,
+      firstHalfIsToday: !!firstHalfLocked[symbol],
+      secondHalf: secondHalfLocked[symbol] || (yData && yData.secondHalf) || null,
+      secondHalfIsToday: !!secondHalfLocked[symbol],
+    };
+  });
+
+  Object.values(bySymbol).forEach(row => {
+    if(result[row.index]) result[row.index].push(row);
+  });
+
+  ['NIFTY', 'BANKNIFTY', 'SENSEX'].forEach(idx => {
+    result[idx].sort((a, b) => {
+      const posDiff = RELATIVE_POS_ORDER.indexOf(a.relativePos) - RELATIVE_POS_ORDER.indexOf(b.relativePos);
+      if(posDiff !== 0) return posDiff;
+      return a.type === b.type ? 0 : (a.type === 'CE' ? -1 : 1);
+    });
+  });
+  return result;
+}
+
 function buildPayload(){
   const orb5 = computeOrbBreakouts(5);
   const orb15 = computeOrbBreakouts(15);
@@ -1590,10 +1951,14 @@ function buildPayload(){
     narrowCamarilla: buildNarrowCamarillaRows(), narrowCamarillaTolerancePct,
     narrowCamarillaScanDone, narrowCamarillaScanTimestamp,
     hasYesterdaySnapshot: Object.keys(yesterdaySnapshot).length > 0,
+    first5MinLocked, first5MinLockedFlag,
+    halfDayLevels: buildHalfDayLevels(),
+    multiStrikeHalfDayLevels: buildMultiStrikeHalfDayLevels(),
     trackedStrike: trackedStrikeSymbols,
     trackedStrikeDepth
   };
 }
+
 
 wss.on('connection', (ws, req) => {
   const parsed = url.parse(req.url, true);
