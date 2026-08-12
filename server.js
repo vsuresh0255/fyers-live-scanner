@@ -340,6 +340,33 @@ function buildLockedScreenerRows(key){
 // market close (3:30 PM), save that alongside the day's final high/low as "yesterday's
 // snapshot" for tomorrow, persisted to disk so it survives a Railway restart overnight.
 const FIRST_5MIN_LOCK_MINUTES = 9 * 60 + 20;
+const PRE_MARKET_CLOSE_MINUTES = 9 * 60 + 9; // just after NSE's 9:00-9:08 pre-market session ends
+let preMarketClose = {}; // symbol -> price captured just after the pre-market session (NIFTY/BANKNIFTY/SENSEX only)
+let preMarketCloseLockedFlag = false;
+let preMarketCloseDateKey = null;
+
+// Captures whatever price is available at/after 9:09 AM as the "pre-market close"
+// reference. NOTE: it's genuinely unverified whether Fyers sends live ticks during
+// NSE's separate 9:00-9:08 pre-market session through this same feed — if not,
+// this will just capture the earliest regular-session price instead, which won't
+// be exactly the pre-market close but won't crash or block anything either.
+function checkAndLockPreMarketClose(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(preMarketCloseDateKey !== dateKey){
+    preMarketCloseDateKey = dateKey;
+    preMarketCloseLockedFlag = false;
+    preMarketClose = {};
+  }
+  if(!preMarketCloseLockedFlag && minutes >= PRE_MARKET_CLOSE_MINUTES){
+    HALF_DAY_SYMBOLS.forEach(symbol => {
+      const s = state[symbol];
+      if(s && s.ltp !== null) preMarketClose[symbol] = s.ltp;
+    });
+    preMarketCloseLockedFlag = true;
+    console.log(`Pre-market close captured for ${Object.keys(preMarketClose).length} symbol(s).`);
+  }
+}
+
 const EOD_SNAPSHOT_MINUTES = 15 * 60 + 30;
 
 let first5MinLocked = {};      // symbol -> {high, close} from today's 9:15-9:20 candle
@@ -1388,6 +1415,7 @@ function recordMinuteSlot(){
   checkAndRunNarrowCprScan();
   checkAndRunNarrowCamarillaScan();
   checkAndRecordRoundNumberSnapshot();
+  checkAndLockPreMarketClose();
   checkAndLockFirstHalf();
   discoverAndSubscribeMultiStrikes();
   checkAndLockSecondHalf();
@@ -1912,6 +1940,7 @@ function buildMultiStrikeHalfDayLevels(){
       firstHalfIsToday: !!firstHalfLocked[symbol],
       secondHalf: secondHalfLocked[symbol] || (yData && yData.secondHalf) || null,
       secondHalfIsToday: !!secondHalfLocked[symbol],
+      first5Min: first5MinLocked[symbol] || null, // for X/Y/Z auto-fill — ATM row's own first-5-min O/H/L/C
     };
   });
 
@@ -1952,6 +1981,7 @@ function buildPayload(){
     narrowCamarillaScanDone, narrowCamarillaScanTimestamp,
     hasYesterdaySnapshot: Object.keys(yesterdaySnapshot).length > 0,
     first5MinLocked, first5MinLockedFlag,
+    preMarketClose, preMarketCloseLockedFlag,
     halfDayLevels: buildHalfDayLevels(),
     multiStrikeHalfDayLevels: buildMultiStrikeHalfDayLevels(),
     trackedStrike: trackedStrikeSymbols,
