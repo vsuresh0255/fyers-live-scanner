@@ -19,6 +19,21 @@
  *
  * symbols.json must be uploaded alongside this file (same folder) — export it
  * from the browser tool's Bhavcopy panel.
+ *
+ * --- RECONNECT BACKOFF / CIRCUIT BREAKER (2026-08 fix) ---
+ * Previously, the stall watchdog retried a fresh Fyers connection every 30s
+ * forever, with no backoff and no limit — including while the token itself
+ * was being rejected on every single subscribe attempt (code -15, "Please
+ * provide valid token"). During one incident this ran for 30+ hours straight,
+ * hammering Fyers' subscribe endpoint hundreds of times even immediately
+ * after a fresh login. That's both wasteful and risks tripping Fyers-side
+ * rate limiting or abuse detection on the app itself.
+ *
+ * Now: each consecutive failed subscribe increases the wait before the next
+ * attempt (exponential backoff, capped). After MAX_CONSECUTIVE_FAILURES in a
+ * row, auto-retry stops entirely and the app sets needsRelogin = true, shown
+ * clearly on the status page — instead of silently spinning forever. The
+ * counters reset the moment a real tick comes in.
  */
 
 const fs = require('fs');
@@ -78,6 +93,42 @@ let isLive = false;
 let lastConnectionAttemptAt = null; // tracks when the current connection attempt started,
                                      // so the watchdog can give it a fair grace period
 
+// ============ reconnect backoff / circuit breaker state ============
+const MAX_CONSECUTIVE_FAILURES = 8;     // stop auto-retrying after this many failed subscribes in a row
+const BASE_BACKOFF_MS = 30 * 1000;      // first retry wait (matches the old fixed 30s)
+const MAX_BACKOFF_MS = 10 * 60 * 1000;  // cap backoff at 10 minutes between attempts
+let consecutiveSubscribeFailures = 0;
+let lastSubscribeFailureAt = null;
+let lastSubscribeFailureReason = null;
+let needsRelogin = false; // true once MAX_CONSECUTIVE_FAILURES is hit — auto-retry stops until a fresh login happens
+
+function currentBackoffMs() {
+  // 30s, 60s, 120s, 240s, ... capped at MAX_BACKOFF_MS
+  const ms = BASE_BACKOFF_MS * Math.pow(2, consecutiveSubscribeFailures);
+  return Math.min(ms, MAX_BACKOFF_MS);
+}
+
+function recordSubscribeFailure(reason) {
+  consecutiveSubscribeFailures++;
+  lastSubscribeFailureAt = new Date().toISOString();
+  lastSubscribeFailureReason = reason;
+  console.log(`Subscribe failure #${consecutiveSubscribeFailures} (${reason}). Next auto-retry backoff: ${Math.round(currentBackoffMs()/1000)}s.`);
+  if (consecutiveSubscribeFailures >= MAX_CONSECUTIVE_FAILURES && !needsRelogin) {
+    needsRelogin = true;
+    console.log(`*** ${MAX_CONSECUTIVE_FAILURES} consecutive subscribe failures — stopping auto-retry. Visit the app's status page and redo the daily login. ***`);
+  }
+}
+
+function recordSubscribeSuccess() {
+  if (consecutiveSubscribeFailures > 0 || needsRelogin) {
+    console.log('Real tick received — clearing subscribe-failure counters.');
+  }
+  consecutiveSubscribeFailures = 0;
+  lastSubscribeFailureAt = null;
+  lastSubscribeFailureReason = null;
+  needsRelogin = false;
+}
+
 // ============ tracked strike depth (user enters one strike, we watch its CE+PE) ============
 let trackedStrikeSymbols = { ce: null, pe: null, strike: null };
 let trackedStrikeDepth = { ce: null, pe: null }; // { maxBuyPrice, maxBuyQty, maxSellPrice, maxSellQty, source: '5-level'|'50-level' }
@@ -134,13 +185,6 @@ function updateStateFromTick(symbol, tick) {
 const EPS = 0.01;
 
 // ============ Round Number Scanner — 15-min candles, continuously live all day ============
-// A "round number" here is simply any multiple of 100 (100, 200, ..., 4500, 4600, ...) —
-// one fixed step for every stock, regardless of price range. On each 15-min candle CLOSE
-// (not every tick — this deliberately avoids flickering in/out as price ticks around),
-// checks that candle's closing price against the nearest round number. If within
-// tolerance, the stock joins the live match list with the candle's time; if a LATER
-// candle drifts back outside tolerance, it's removed — this runs continuously all day,
-// unlike the 9:21-locked screeners above.
 let roundNumberCandleState = {}; // symbol -> {bucketStart, open, high, low, close}
 let roundNumberMatches = {};     // symbol -> {roundNumber, closePrice, matchedAt}
 let roundNumberTolerancePct = 0.1; // configurable via /set-round-tolerance
@@ -178,8 +222,6 @@ function updateRoundNumberCandle(symbol, price){
   const existing = roundNumberCandleState[symbol];
 
   if(!existing || existing.bucketStart !== bucketStart){
-    // a new 15-min window has started — if there was a candle before this, it just
-    // closed, so evaluate IT (not the brand new one) against the round-number tolerance
     if(existing){
       const match = roundNumberMatchFor(existing.close);
       if(match !== null){
@@ -189,7 +231,7 @@ function updateRoundNumberCandle(symbol, price){
           matchedAt: `${String(Math.floor(existing.bucketStart/60)).padStart(2,'0')}:${String(existing.bucketStart%60).padStart(2,'0')}`,
         };
       } else {
-        delete roundNumberMatches[symbol]; // no longer close enough as of the latest completed candle
+        delete roundNumberMatches[symbol];
       }
     }
     roundNumberCandleState[symbol] = { bucketStart, open: price, high: price, low: price, close: price };
@@ -210,17 +252,10 @@ function buildRoundNumberRows(){
   }));
 }
 
-// Takes a snapshot of the current round-number matches once per 15-min bucket and keeps
-// a running history — separate from roundNumberMatches itself, which only ever reflects
-// the SINGLE most recent 15-min candle close per symbol (older matches are overwritten,
-// not kept). Called every minute via recordMinuteSlot() like everything else, but the
-// bucket check below means it only actually records once per 15-min window, not every
-// minute. Newest snapshot is added to the FRONT of the array (unshift), so the history
-// is already in newest-first order with no sorting needed on the browser side.
 function checkAndRecordRoundNumberSnapshot(){
   const { minutes } = getISTDateKeyAndMinutes();
   const bucketStart = get15MinBucketStart(minutes);
-  if(lastRoundNumberSnapshotBucket === bucketStart) return; // already recorded this window
+  if(lastRoundNumberSnapshotBucket === bucketStart) return;
   lastRoundNumberSnapshotBucket = bucketStart;
 
   const rows = buildRoundNumberRows();
@@ -229,22 +264,12 @@ function checkAndRecordRoundNumberSnapshot(){
   saveRoundNumberHistory();
 }
 
-// ============ single 9:21 scan-and-lock for Open=Low / Open=High / Gap-Neutral ============
-// At exactly this one moment, scan every stock once and lock in whichever ones satisfy
-// each condition — that becomes the permanent result for the rest of the trading day.
-// No continuous re-checking afterward: a stock that matched at 9:21 stays on the list
-// even if it stops matching later, and nothing new can join after this point. Only the
-// LTP shown for these locked stocks keeps refreshing live, since that's just useful
-// reference info and doesn't require re-scanning anything.
-//
-// Change this one value to move the scan time (currently 9:21 AM IST):
 const SCREENER_SCAN_TIME_MINUTES = 9 * 60 + 21;
 
-let screenerScanResults = { openlow: null, openhigh: null, gapneutral: null }; // null until scanned today
+let screenerScanResults = { openlow: null, openhigh: null, gapneutral: null };
 let screenerScanDone = false;
 let screenerScanDateKey = null;
-let screenerScanTimestamp = null; // time label (e.g. "09:21") for display — may be later than
-                                   // the target time if the server started late that day
+let screenerScanTimestamp = null;
 
 function checkAndRunScreenerScan(){
   const { dateKey, minutes } = getISTDateKeyAndMinutes();
@@ -256,9 +281,6 @@ function checkAndRunScreenerScan(){
     screenerScanTimestamp = null;
   }
 
-  // fires at the target time on a normal day; also fires immediately if the server is
-  // started (or reconnects) late and today's scan hasn't happened yet — better to scan
-  // late using current state than to never scan at all
   if(!screenerScanDone && minutes >= SCREENER_SCAN_TIME_MINUTES){
     const snap = computeScreenersUnrestricted();
     screenerScanResults.openlow = snap.openEqLow;
@@ -277,12 +299,6 @@ function computeScreenersUnrestricted() {
     const s = state[symbol];
     if (s.open === null || s.high === null || s.low === null) return;
 
-    // Open=Low: first 5-min candle's open equals its own low (price never dipped below
-    // the open during the first 5 minutes) AND that candle's close is already above
-    // yesterday's full-day high — reuses the same first5MinLocked/yesterdaySnapshot data
-    // built for the Early Exhaustion/Early Bottom screeners, evaluated the same way (only
-    // meaningful once the first candle has locked at 9:20, and only if yesterday's
-    // snapshot exists — both null-safe here, correctly yields no match until then)
     const first5Min = first5MinLocked[symbol];
     const yest = yesterdaySnapshot[symbol];
     if (first5Min && yest) {
@@ -296,9 +312,6 @@ function computeScreenersUnrestricted() {
       }
     }
 
-    // Open=High: mirror of the above — first 5-min candle's open equals its own high
-    // (price never rose above the open during the first 5 minutes) AND that candle's
-    // close is already below yesterday's full-day low
     if (first5Min && yest) {
       const openEqualsFirst5MinHigh = Math.abs(s.open - first5Min.high) <= EPS;
       const closedBelowYesterdayLow = first5Min.close < yest.dayLow;
@@ -314,8 +327,6 @@ function computeScreenersUnrestricted() {
   return { openEqLow, openEqHigh, gapNeutral };
 }
 
-// builds the "Right Now" rows for a locked screener: same frozen open/low/high/prevClose
-// from the moment of the scan, but ltp refreshed against current live state
 function buildLockedScreenerRows(key){
   const frozen = screenerScanResults[key];
   if(!frozen) return [];
@@ -326,30 +337,12 @@ function buildLockedScreenerRows(key){
   }));
 }
 
-// ============ Early Exhaustion Breakdown screener ============
-// Pattern: yesterday's first 5-min candle (9:15-9:20) high WAS yesterday's full-day high
-// (stock made its high immediately, then faded all day) — AND today's first 5-min candle
-// high is ALSO today's high so far (the same early-exhaustion pattern repeating) — AND
-// today's first-5-min candle closed BELOW yesterday's full-day low (already broken down
-// through yesterday's entire range within the first 5 minutes). Locks once at 9:21, same
-// as the other three simple screeners.
-//
-// This needs "yesterday's" data, which nothing else in this file tracks — so this section
-// builds its own overnight-persistent snapshot: at 9:20 sharp, lock each stock's first-5-min
-// high/close from the live feed itself (no bhavcopy or other external file needed); at
-// market close (3:30 PM), save that alongside the day's final high/low as "yesterday's
-// snapshot" for tomorrow, persisted to disk so it survives a Railway restart overnight.
 const FIRST_5MIN_LOCK_MINUTES = 9 * 60 + 20;
-const PRE_MARKET_CLOSE_MINUTES = 9 * 60 + 9; // just after NSE's 9:00-9:08 pre-market session ends
-let preMarketClose = {}; // symbol -> price captured just after the pre-market session (NIFTY/BANKNIFTY/SENSEX only)
+const PRE_MARKET_CLOSE_MINUTES = 9 * 60 + 9;
+let preMarketClose = {};
 let preMarketCloseLockedFlag = false;
 let preMarketCloseDateKey = null;
 
-// Captures whatever price is available at/after 9:09 AM as the "pre-market close"
-// reference. NOTE: it's genuinely unverified whether Fyers sends live ticks during
-// NSE's separate 9:00-9:08 pre-market session through this same feed — if not,
-// this will just capture the earliest regular-session price instead, which won't
-// be exactly the pre-market close but won't crash or block anything either.
 function checkAndLockPreMarketClose(){
   const { dateKey, minutes } = getISTDateKeyAndMinutes();
   if(preMarketCloseDateKey !== dateKey){
@@ -369,46 +362,36 @@ function checkAndLockPreMarketClose(){
 
 const EOD_SNAPSHOT_MINUTES = 15 * 60 + 30;
 
-let first5MinLocked = {};      // symbol -> {high, close} from today's 9:15-9:20 candle
+let first5MinLocked = {};
 let first5MinLockedFlag = false;
 let first5MinDateKey = null;
 
-let yesterdaySnapshot = {};    // symbol -> {first5MinHigh, dayHigh, dayLow} — survives overnight
+let yesterdaySnapshot = {};
 let eodSnapshotSavedToday = false;
 let eodSnapshotDateKey = null;
 
-// ============ Half-day (first/second 195-min half) tracking — NIFTY/BANKNIFTY/SENSEX only ============
-// First half = 9:15-12:30 (195 min from open). Second half = 12:30-3:30 (close). Each
-// display slot always shows the most recently COMPLETED version of that half — today's
-// once it locks, yesterday's persisted value until then.
 const HALF_DAY_SYMBOLS = ['NIFTY', 'BANKNIFTY', 'SENSEX'];
-const FIRST_HALF_LOCK_MINUTES = 9 * 60 + 15 + 195; // 12:30 PM
-// second half locks at EOD_SNAPSHOT_MINUTES (market close), reusing the existing constant
+const FIRST_HALF_LOCK_MINUTES = 9 * 60 + 15 + 195;
 
-let firstHalfLocked = {};    // symbol -> {open, high, low, close} — today's first half
-let secondHalfRunning = {};  // symbol -> {high, low} — running high/low from 12:30 PM, tick-accurate
-let secondHalfOpen = {};     // symbol -> price at 12:30 PM (second half's own open)
-let secondHalfLocked = {};   // symbol -> {open, high, low, close} — today's second half
-let yesterdayHalves = {};    // symbol -> {firstHalf:{...}, secondHalf:{...}} — persists overnight
+let firstHalfLocked = {};
+let secondHalfRunning = {};
+let secondHalfOpen = {};
+let secondHalfLocked = {};
+let yesterdayHalves = {};
 let halfDayDateKey = null;
 let firstHalfLockedFlag = false;
 let secondHalfLockedFlag = false;
 
-// ============ Multi-strike half-day tracking (ATM +/- 5, NIFTY/BANKNIFTY/SENSEX) ============
-// Verified column layout from Fyers' own symbol master (both NSE_FO.csv and
-// BSE_FO.csv use the identical layout): col 8 = expiry timestamp, col 9 =
-// tradable Fyers symbol, col 13 = underlying symbol, col 15 = strike price,
-// col 16 = option type ('CE'/'PE') or 'XX' for futures rows.
-const STRIKE_INTERVALS = { NIFTY: 50, BANKNIFTY: 100, SENSEX: 100 }; // current well-known convention; NSE/BSE occasionally revise these as index levels rise
-const STRIKE_TRACK_RANGE = 5; // 5 above + 5 below + ATM = 11 strikes per index
+const STRIKE_INTERVALS = { NIFTY: 50, BANKNIFTY: 100, SENSEX: 100 };
+const STRIKE_TRACK_RANGE = 5;
 const NSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/NSE_FO.csv';
 const BSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/BSE_FO.csv';
 
-let multiStrikeMeta = {};       // fyersSymbol -> {index, relativePos, type, strike}
-let multiStrikeSymbolList = []; // flat list of fyersSymbols currently tracked, extends HALF_DAY_SYMBOLS for locking
+let multiStrikeMeta = {};
+let multiStrikeSymbolList = [];
 let multiStrikeSelectedToday = false;
-let multiStrikeDiscoveryInProgress = false; // guards against overlapping calls while the async fetch is in flight
-let yesterdayMultiStrikeHalves = {}; // "INDEX_RELPOS_TYPE" -> {firstHalf:{...}, secondHalf:{...}} — keyed by RELATIVE position, not literal strike, since the actual strike shifts day to day
+let multiStrikeDiscoveryInProgress = false;
+let yesterdayMultiStrikeHalves = {};
 
 function fetchUrl(targetUrl){
   return new Promise((resolve, reject) => {
@@ -423,7 +406,7 @@ function fetchUrl(targetUrl){
 function parseStrikesFromCsv(csvText, indexSymbol, atmStrike, interval){
   if(!csvText) return {};
   const nowTs = Date.now() / 1000;
-  const bestByKey = {}; // "strike_CE" -> {expiryTs, fyersSymbol}
+  const bestByKey = {};
   csvText.split('\n').forEach(line => {
     const cols = line.split(',');
     if(cols.length < 17) return;
@@ -435,7 +418,7 @@ function parseStrikesFromCsv(csvText, indexSymbol, atmStrike, interval){
     const strike = parseFloat(cols[15]);
     const fyersSymbol = (cols[9] || '').trim();
     if(isNaN(expiryTs) || isNaN(strike) || !fyersSymbol) return;
-    if(expiryTs < nowTs) return; // already expired
+    if(expiryTs < nowTs) return;
     const key = `${strike}_${optType}`;
     if(!bestByKey[key] || expiryTs < bestByKey[key].expiryTs){
       bestByKey[key] = { expiryTs, fyersSymbol };
@@ -456,14 +439,11 @@ function parseStrikesFromCsv(csvText, indexSymbol, atmStrike, interval){
   return result;
 }
 
-// Runs once per day, shortly after market open once each index has a real
-// live price to compute ATM from. Fixed for the rest of the day once
-// selected, per the confirmed design — does not re-pick as ATM shifts.
 async function discoverAndSubscribeMultiStrikes(){
   if(multiStrikeSelectedToday || multiStrikeDiscoveryInProgress) return;
   const indices = ['NIFTY', 'BANKNIFTY', 'SENSEX'];
   const notReady = indices.filter(sym => !state[sym] || state[sym].ltp === null);
-  if(notReady.length > 0) return; // wait quietly until all three have a live price
+  if(notReady.length > 0) return;
 
   multiStrikeDiscoveryInProgress = true;
   try{
@@ -500,11 +480,9 @@ async function discoverAndSubscribeMultiStrikes(){
   }
 }
 
-// Tick-accurate — called from updateStateFromTick(), not sampled once per minute, so a
-// brief intra-minute spike during the second half isn't missed.
 function updateSecondHalfTracking(symbol, ltp){
   if(!HALF_DAY_SYMBOLS.includes(symbol) && !multiStrikeSymbolList.includes(symbol)) return;
-  if(!firstHalfLockedFlag || secondHalfLockedFlag) return; // only between the two locks
+  if(!firstHalfLockedFlag || secondHalfLockedFlag) return;
   if(!secondHalfRunning[symbol]){
     secondHalfRunning[symbol] = { high: ltp, low: ltp };
   } else {
@@ -514,7 +492,7 @@ function updateSecondHalfTracking(symbol, ltp){
 }
 
 
-let earlyExhaustionResults = null; // locked at 9:21, same pattern as the other 3 screeners
+let earlyExhaustionResults = null;
 let earlyExhaustionScanDone = false;
 let earlyExhaustionScanTimestamp = null;
 let earlyExhaustionDateKey = null;
@@ -561,14 +539,6 @@ function checkAndSaveEODSnapshot(){
 function checkAndLockFirstHalf(){
   const { dateKey, minutes } = getISTDateKeyAndMinutes();
   if(halfDayDateKey !== dateKey){
-    // new day — roll TODAY's now-completed halves into yesterdayHalves before resetting,
-    // so the display has something to fall back to until today's own halves complete.
-    // Also gates the multi-strike reset — without this same guard, the FIRST-EVER call
-    // to this function in a fresh process (halfDayDateKey starts as null) would look
-    // identical to a genuine day change, wiping out multi-strike symbols that
-    // discoverAndSubscribeMultiStrikes() may have JUST found earlier in this same
-    // minute (it runs first in recordMinuteSlot()). This would fire on every single
-    // server restart, not just real day rollovers — a real bug caught in testing.
     if(halfDayDateKey !== null){
       HALF_DAY_SYMBOLS.forEach(symbol => {
         if(firstHalfLocked[symbol] || secondHalfLocked[symbol]){
@@ -581,7 +551,6 @@ function checkAndLockFirstHalf(){
       rollMultiStrikeIntoYesterday();
       saveYesterdayHalves();
       saveYesterdayMultiStrikeHalves();
-      // multi-strike selection resets ONLY on a genuine day change — ATM likely shifted
       multiStrikeSelectedToday = false;
       multiStrikeMeta = {};
       multiStrikeSymbolList = [];
@@ -600,8 +569,8 @@ function checkAndLockFirstHalf(){
       const s = state[symbol];
       if(s && s.open !== null && s.high !== null && s.low !== null && s.ltp !== null){
         firstHalfLocked[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
-        secondHalfOpen[symbol] = s.ltp; // second half's own open = first half's close
-        secondHalfRunning[symbol] = { high: s.ltp, low: s.ltp }; // seed the second-half tracker
+        secondHalfOpen[symbol] = s.ltp;
+        secondHalfRunning[symbol] = { high: s.ltp, low: s.ltp };
       }
     });
     firstHalfLockedFlag = true;
@@ -609,10 +578,6 @@ function checkAndLockFirstHalf(){
   }
 }
 
-// Rolls today's locked multi-strike data into yesterdayMultiStrikeHalves, keyed
-// by RELATIVE position ("NIFTY_ATM+2_CE") rather than the literal Fyers symbol —
-// today's ATM+2 is very likely a different actual strike than tomorrow's ATM+2,
-// but the relative-position comparison is what's meaningful across days.
 function rollMultiStrikeIntoYesterday(){
   multiStrikeSymbolList.forEach(symbol => {
     const meta = multiStrikeMeta[symbol];
@@ -642,8 +607,6 @@ function checkAndLockSecondHalf(){
     });
     secondHalfLockedFlag = true;
     console.log(`Second-half (12:30-3:30) locked for ${Object.keys(secondHalfLocked).length} symbol(s).`);
-    // roll today's completed halves into yesterday* immediately (not waiting for
-    // tomorrow's date-change) so a restart tonight doesn't lose today's second half
     HALF_DAY_SYMBOLS.forEach(symbol => {
       if(firstHalfLocked[symbol] || secondHalfLocked[symbol]){
         yesterdayHalves[symbol] = {
@@ -699,14 +662,6 @@ function buildEarlyExhaustionRows(){
   }));
 }
 
-// ============ Early Bottom Breakout screener (bullish mirror of the above) ============
-// Pattern: yesterday's first 5-min candle low WAS yesterday's full-day low (stock bottomed
-// immediately, then rallied all day) — AND today's first 5-min candle low is ALSO today's
-// low so far (same early-bottom pattern repeating) — AND today's first-5-min candle closed
-// ABOVE yesterday's full-day high (already broken out above yesterday's entire range within
-// the first 5 minutes). Reuses the exact same first5MinLocked/yesterdaySnapshot data captured
-// above (both already track high AND low), just evaluated with the mirrored condition —
-// locks separately at 9:21, same as its bearish counterpart.
 let earlyBottomResults = null;
 let earlyBottomScanDone = false;
 let earlyBottomScanTimestamp = null;
@@ -753,15 +708,6 @@ function buildEarlyBottomRows(){
   }));
 }
 
-// ============ Camarilla R4/S4 Breakout screener ============
-// Buy: first 5-min candle's close is above yesterday's Camarilla R4 level.
-// Sell: first 5-min candle's close is below yesterday's Camarilla S4 level.
-// R4/S4 use the exact same formula as shared.js's computeCamarilla(), computed from
-// yesterday's High/Low (from the same yesterdaySnapshot already built for the other
-// screeners) and yesterday's Close (Fyers already sends this live as prevClose — no
-// separate tracking needed for that piece). Locked once at 9:21, same as the others.
-// The live highlighting (LTP still above R4 / below S4) is a frontend-only concern —
-// the backend just needs to keep sending the fixed r4/s4 threshold alongside live LTP.
 function computeCamarilla(h, l, c){
   const rng = h - l;
   return {
@@ -829,11 +775,6 @@ function buildCamarillaSellRows(){
   }));
 }
 
-// ============ Narrow CPR screener ============
-// Standard Central Pivot Range, computed purely from yesterday's High/Low/Close (same
-// data source as the Camarilla screener above — no dependency on today's price action
-// at all). Locked at 9:21 for consistency with the rest of the suite, though the
-// underlying numbers are already fully determined before market open.
 function computeCPR(h, l, c){
   const pp = (h + l + c) / 3;
   const bc = (h + l) / 2;
@@ -842,7 +783,7 @@ function computeCPR(h, l, c){
   return { pp, bc, tc, widthPct };
 }
 
-let narrowCprTolerancePct = 0.5; // configurable via /set-cpr-tolerance
+let narrowCprTolerancePct = 0.5;
 let narrowCprResults = null;
 let narrowCprScanDone = false;
 let narrowCprScanTimestamp = null;
@@ -886,19 +827,12 @@ function buildNarrowCprRows(){
   }));
 }
 
-// ============ Narrow Camarilla screener ============
-// Different from Narrow CPR: this measures yesterday's raw trading range (High-Low)
-// relative to yesterday's close — NOT where close sat within that range (which is what
-// CPR width measures). Since R4-S4 = (H-L) * 1.1, this is directly proportional to how
-// wide the Camarilla R4/S4 spread itself was — a narrow value here means genuine
-// volatility compression in yesterday's actual trading range. Same 9:21 lock pattern,
-// same configurable-tolerance UI as Narrow CPR and Round Number Scanner.
 function computeNarrowCamarillaRange(h, l, c){
   const rangePct = c !== 0 ? Math.abs(h - l) / c * 100 : null;
   return { rangePct };
 }
 
-let narrowCamarillaTolerancePct = 1.0; // configurable via /set-camarilla-tolerance
+let narrowCamarillaTolerancePct = 1.0;
 let narrowCamarillaResults = null;
 let narrowCamarillaScanDone = false;
 let narrowCamarillaScanTimestamp = null;
@@ -922,7 +856,7 @@ function checkAndRunNarrowCamarillaScan(){
       const { rangePct } = computeNarrowCamarillaRange(yest.dayHigh, yest.dayLow, s.prevClose);
       if(rangePct !== null && rangePct <= narrowCamarillaTolerancePct){
         const cam = computeCamarilla(yest.dayHigh, yest.dayLow, s.prevClose);
-        const pp = (yest.dayHigh + yest.dayLow + s.prevClose) / 3; // same PP formula as Narrow CPR, for consistency
+        const pp = (yest.dayHigh + yest.dayLow + s.prevClose) / 3;
         const direction = today.close > pp ? 'buy' : 'sell';
         matches.push({ symbol, rangePct, r4: cam.r4, s4: cam.s4, pp, direction, ltp: s.ltp });
       }
@@ -956,16 +890,6 @@ function computeScreeners() {
   return { openEqLow, openEqHigh, gapNeutral, volumeShockers, updatedAt: new Date().toISOString(), isLive, lastTickReceivedAt };
 }
 
-// ============ minute-by-minute historical slot tracking ============
-// Runs on the SERVER (not per-browser), so a browser connecting at 12:30 still sees
-// what happened at 9:15, 9:20, etc. Each symbol is recorded only in the FIRST minute
-// it qualifies for a given screener — later minutes where it's still qualifying don't
-// repeat it, per your "make it unique" request.
-//
-// PERSISTENCE: written to disk so history survives a Railway redeploy, not just a
-// simple in-memory restart. Requires a Railway Volume mounted at the path below —
-// see the README for setup steps. Without a volume, this still works fine during
-// normal operation (all day, no redeploys); it just won't survive a code update.
 const PERSIST_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
 const PERSIST_FILE = path.join(PERSIST_DIR, 'slot_history.json');
 
@@ -973,11 +897,6 @@ let slotHistory = { openlow: [], openhigh: [], gapneutral: [], orb5up: [], orb5d
 let alreadySeen = { openlow: new Set(), openhigh: new Set(), gapneutral: new Set(), orb5up: new Set(), orb5down: new Set(), orb15up: new Set(), orb15down: new Set() };
 
 function todayDateKey(){
-  // Must use IST's calendar date, not UTC's — otherwise this disagrees with the
-  // IST-based day-reset logic used elsewhere (e.g. ORB tracking), specifically during
-  // IST evening hours when it's already a new day in IST but still the previous date
-  // in UTC. That mismatch could let a previous day's stale slot history survive a
-  // restart and mix in with today's genuinely fresh entries.
   return getISTDateKeyAndMinutes().dateKey;
 }
 
@@ -995,7 +914,7 @@ function loadPersistedHistory(){
     slotHistory = saved.slotHistory;
     Object.keys(alreadySeen).forEach(key => {
       alreadySeen[key] = new Set((saved.alreadySeen && saved.alreadySeen[key]) || []);
-      if(!slotHistory[key]) slotHistory[key] = []; // in case this key didn't exist in an older saved file
+      if(!slotHistory[key]) slotHistory[key] = [];
     });
     console.log('Restored slot history from disk — survived the restart/redeploy.');
   } catch(err){
@@ -1005,7 +924,7 @@ function loadPersistedHistory(){
 
 function savePersistedHistory(){
   try{
-    if(!fs.existsSync(PERSIST_DIR)) return; // no volume mounted — skip silently, still works in-memory
+    if(!fs.existsSync(PERSIST_DIR)) return;
     const toSave = {
       date: todayDateKey(),
       slotHistory,
@@ -1019,7 +938,6 @@ function savePersistedHistory(){
 
 loadPersistedHistory();
 
-// ============ persistence for the 9:21 screener scan (survives Railway redeploys) ============
 const SCREENER_SCAN_PERSIST_FILE = path.join(PERSIST_DIR, 'screener_scan.json');
 
 function loadScreenerScanResults(){
@@ -1055,7 +973,6 @@ function saveScreenerScanResults(){
 
 loadScreenerScanResults();
 
-// ============ persistence for the Early Exhaustion Breakdown screener ============
 const YESTERDAY_SNAPSHOT_FILE = path.join(PERSIST_DIR, 'yesterday_snapshot.json');
 const EARLY_EXHAUSTION_PERSIST_FILE = path.join(PERSIST_DIR, 'early_exhaustion_scan.json');
 
@@ -1066,11 +983,6 @@ function loadYesterdaySnapshot(){
       return;
     }
     const saved = JSON.parse(fs.readFileSync(YESTERDAY_SNAPSHOT_FILE, 'utf8'));
-    // deliberately NOT checking saved.date against today here — unlike the other persisted
-    // state, this one is SUPPOSED to carry forward from a previous day, that's its entire
-    // purpose. Only discard it if it's implausibly old (e.g. server was off for a long
-    // stretch), so a genuinely stale multi-week-old snapshot doesn't silently keep matching
-    // against a "yesterday" that's actually long gone.
     const ageDays = (new Date(todayDateKey()) - new Date(saved.date)) / (1000*60*60*24);
     if(ageDays > 5){
       console.log(`Saved snapshot is from ${saved.date}, ${Math.round(ageDays)} days ago — too stale to trust as "yesterday", ignoring it.`);
@@ -1101,8 +1013,6 @@ function loadYesterdayHalves(){
       return;
     }
     const saved = JSON.parse(fs.readFileSync(YESTERDAY_HALVES_FILE, 'utf8'));
-    // same staleness tolerance as yesterdaySnapshot — carries forward across a normal
-    // weekend/holiday gap, but not an implausibly long one
     const ageDays = (new Date(todayDateKey()) - new Date(saved.date)) / (1000*60*60*24);
     if(ageDays > 5){
       console.log(`Saved half-day snapshot is from ${saved.date}, ${Math.round(ageDays)} days ago — too stale, ignoring it.`);
@@ -1158,7 +1068,7 @@ function loadEarlyExhaustionResults(){
   try{
     if(!fs.existsSync(EARLY_EXHAUSTION_PERSIST_FILE)) return;
     const saved = JSON.parse(fs.readFileSync(EARLY_EXHAUSTION_PERSIST_FILE, 'utf8'));
-    if(saved.date !== todayDateKey()) return; // this one DOES reset daily, same as the other 9:21 scans
+    if(saved.date !== todayDateKey()) return;
     earlyExhaustionResults = saved.earlyExhaustionResults;
     earlyExhaustionScanDone = saved.earlyExhaustionScanDone;
     earlyExhaustionDateKey = saved.date;
@@ -1326,12 +1236,6 @@ loadYesterdayHalves();
 loadYesterdayMultiStrikeHalves();
 
 function timeLabel(){
-  // Date.now()/getTime() is ALWAYS an absolute UTC timestamp, completely independent of
-  // whatever the server's own local timezone happens to be set to — no need to account
-  // for that separately. Earlier code incorrectly also added the server's local timezone
-  // offset on top of the fixed IST conversion, which only happened to look correct if the
-  // container's local timezone was exactly UTC; if it wasn't, this silently produced the
-  // wrong time. Only add the fixed +5:30 IST offset, nothing else.
   const now = new Date();
   const istMillis = now.getTime() + (5.5 * 60 * 60 * 1000);
   const ist = new Date(istMillis);
@@ -1347,22 +1251,16 @@ function getISTDateKeyAndMinutes(){
   return { dateKey, minutes };
 }
 
-// ============ Opening Range Breakout (ORB) tracking — 5-min and 15-min ============
-// The opening range for a stock is simply its cumulative high/low from market open (9:15)
-// through the lock time (9:20 for 5-min, 9:30 for 15-min) — since Fyers ticks already carry
-// the cumulative high/low since open, we don't need a separate accumulator, just a snapshot
-// of state[symbol].high/low taken at exactly the right moment.
-const orb5Locked = {};   // symbol -> {high, low}
-const orb15Locked = {};  // symbol -> {high, low}
+const orb5Locked = {};
+const orb15Locked = {};
 let orb5LockedFlag = false;
 let orb15LockedFlag = false;
-let orbLockedDateKey = null; // resets orb5/orb15 fresh each new trading day
+let orbLockedDateKey = null;
 
 function checkAndLockOpeningRanges(){
   const { dateKey, minutes } = getISTDateKeyAndMinutes();
 
   if(orbLockedDateKey !== dateKey){
-    // new trading day — clear yesterday's locked ranges and start fresh
     orbLockedDateKey = dateKey;
     orb5LockedFlag = false;
     orb15LockedFlag = false;
@@ -1401,8 +1299,7 @@ function computeOrbBreakouts(minutes){
   return { up, down };
 }
 
-let lastKnownDateKey = null; // tracks the day slotHistory currently belongs to, so an
-                              // ongoing (not restarted) server correctly resets at midnight
+let lastKnownDateKey = null;
 
 function recordMinuteSlot(){
   checkAndLockOpeningRanges();
@@ -1420,9 +1317,6 @@ function recordMinuteSlot(){
   discoverAndSubscribeMultiStrikes();
   checkAndLockSecondHalf();
 
-  // detect a day rollover DURING ongoing operation — without this, a server that stays
-  // running overnight (rather than restarting) never re-checks the date, so slotHistory
-  // from yesterday just keeps accumulating instead of resetting for the new trading day.
   const currentDateKey = todayDateKey();
   if(lastKnownDateKey !== null && lastKnownDateKey !== currentDateKey){
     console.log(`Trading day changed (${lastKnownDateKey} -> ${currentDateKey}) — resetting slot history for the new day.`);
@@ -1433,10 +1327,6 @@ function recordMinuteSlot(){
   }
   lastKnownDateKey = currentDateKey;
 
-  // Open=Low / Open=High / Gap-Neutral no longer use this minute-by-minute mechanism —
-  // see checkAndRunScreenerScan() above, which locks all three in a single scan at
-  // SCREENER_SCAN_TIME_MINUTES. Only ORB breakouts still use per-minute slot tracking,
-  // since those genuinely can produce new breakouts at any point during the day.
   const orb5 = computeOrbBreakouts(5);
   const orb15 = computeOrbBreakouts(15);
   const groups = {
@@ -1455,8 +1345,6 @@ function recordMinuteSlot(){
   savePersistedHistory();
 }
 
-// check every 10 seconds whether a new clock-minute has started, and if so, record it —
-// more reliable than a raw 60s interval, which can drift out of alignment with real clock minutes
 let lastRecordedMinute = null;
 setInterval(() => {
   try{
@@ -1465,7 +1353,7 @@ setInterval(() => {
       console.log(`Minute changed: ${lastRecordedMinute} -> ${label}, recording new slot.`);
       lastRecordedMinute = label;
       recordMinuteSlot();
-      broadcastScreeners(); // push the newly recorded minute out immediately
+      broadcastScreeners();
       console.log(`Slot recorded successfully. openlow history now has ${slotHistory.openlow.length} entries.`);
     }
   } catch(err){
@@ -1486,21 +1374,12 @@ function startFyersConnection(accessToken) {
   const fullToken = `${APP_ID}:${accessToken}`;
   fyersSocket = fyersDataSocket.getInstance(fullToken, __dirname, false);
 
-  // Defensive fix for a real memory leak: Fyers' "getInstance" naming strongly suggests
-  // this may return a shared/singleton object rather than a genuinely fresh one on every
-  // call. Without this, every reconnect (which happens often — see the known SDK
-  // reliability issue) would stack a new set of listeners on top of the old ones,
-  // accumulating hundreds over a trading day and causing the OOM crashes we saw.
   if (typeof fyersSocket.removeAllListeners === 'function') {
     fyersSocket.removeAllListeners();
   }
 
   fyersSocket.on('connect', () => {
     console.log('Connected to Fyers live data feed. Waiting briefly before subscribing (a brand-new token can take a moment to fully activate on Fyers\' side)...');
-    // Small delay before the actual subscribe call — working theory for the "Please
-    // provide valid token" error seen immediately after a fresh login: the token is
-    // valid enough for the initial connection handshake, but may need a moment to
-    // fully propagate on Fyers' backend before it's accepted for subscribe-level auth.
     setTimeout(() => {
       console.log('Subscribing to', symbols.length, 'symbols...');
       fyersSocket.subscribe(symbols);
@@ -1513,11 +1392,10 @@ function startFyersConnection(accessToken) {
     if (symbol && state[symbol]) {
       updateStateFromTick(symbol, tick);
       lastTickReceivedAt = new Date().toISOString();
+      recordSubscribeSuccess(); // a real tick proves the token/subscribe is genuinely working — clear the failure/backoff state
       scheduleBroadcast();
     }
 
-    // separately, check if this is a depth tick for our currently-tracked strike's
-    // CE or PE symbol (these aren't in `state`, since that's only the fixed 210-stock list)
     if (tick && tick.type === 'dp' && symbol) {
       if (symbol === trackedStrikeSymbols.ce) {
         trackedStrikeDepth.ce = computeMaxLevelsFrom5(tick);
@@ -1529,7 +1407,14 @@ function startFyersConnection(accessToken) {
     }
   });
 
-  fyersSocket.on('error', msg => console.error('Fyers WS error:', msg));
+  fyersSocket.on('error', msg => {
+    console.error('Fyers WS error:', msg);
+    // code -15 = "Please provide valid token" — a rejected/expired token, not a transient
+    // network blip. Track it separately so repeated rejections trigger backoff/circuit-break
+    // instead of being retried at the same fixed interval as a genuine network hiccup.
+    const reason = (msg && msg.code === -15) ? 'invalid token (-15)' : `error code ${msg && msg.code}`;
+    recordSubscribeFailure(reason);
+  });
   fyersSocket.on('close', () => { console.log('Fyers WS connection closed.'); isLive = false; });
 
   fyersSocket.autoreconnect(6);
@@ -1537,18 +1422,12 @@ function startFyersConnection(accessToken) {
 }
 
 // ============ stall watchdog ============
-// The known failure mode with this SDK: the connection can go silent — no error, no
-// close event — it just stops delivering ticks. The SDK's own autoreconnect only
-// fires on an actual error/close, so it never catches this. This checks independently:
-// if we're within market hours and haven't seen a real tick in a while, force a fresh
-// reconnect using the same stored access token, rather than waiting for an error that
-// may never come.
 function isMarketHoursIST(){
   const now = new Date();
-  const istOffset = 5.5 * 60; // IST is UTC+5:30, in minutes
+  const istOffset = 5.5 * 60;
   const utcMinutes = now.getUTCHours()*60 + now.getUTCMinutes();
   const istMinutes = (utcMinutes + istOffset) % (24*60);
-  const day = now.getUTCDay(); // adjust for date-line, but day-of-week is close enough here
+  const day = now.getUTCDay();
   const isWeekday = day >= 1 && day <= 5;
   return isWeekday && istMinutes >= (9*60+15) && istMinutes <= (15*60+30);
 }
@@ -1558,13 +1437,24 @@ const STALL_THRESHOLD_MS = 90 * 1000; // 90 seconds with no real tick = consider
 setInterval(() => {
   if(!currentAccessToken || !isMarketHoursIST()) return; // nothing to watch if not logged in or market closed
 
-  // give a freshly-started connection a fair chance to receive its first tick before
-  // judging it — without this, "no tick yet" (normal for the first few seconds) reads
-  // identically to "genuinely stalled", causing the watchdog to fire immediately after
-  // every connect and race against the SDK's own still-in-progress handshake, which is
-  // exactly what caused the uncaught "readyState 0 (CONNECTING)" crashes.
+  // Circuit breaker: once we've hit MAX_CONSECUTIVE_FAILURES in a row, stop auto-retrying
+  // entirely. Hammering Fyers every 30-90s with a token that's already been rejected
+  // repeatedly accomplishes nothing and risks tripping rate limits — a human needs to
+  // redo the daily login instead. This flag only clears via recordSubscribeSuccess()
+  // (a real tick came in) or a fresh /submit-auth-code login.
+  if(needsRelogin) return;
+
   const sinceConnectionStarted = lastConnectionAttemptAt ? Date.now() - lastConnectionAttemptAt : Infinity;
   if(sinceConnectionStarted < STALL_THRESHOLD_MS) return;
+
+  // Exponential backoff: don't retry again until enough time has passed since the
+  // last known subscribe failure. If there's been no failure recorded yet (e.g. a
+  // genuine silent stall with no error at all), fall through to the normal
+  // stale-tick check below at the standard cadence.
+  if(lastSubscribeFailureAt){
+    const sinceLastFailure = Date.now() - new Date(lastSubscribeFailureAt).getTime();
+    if(sinceLastFailure < currentBackoffMs()) return;
+  }
 
   const staleFor = lastTickReceivedAt ? Date.now() - new Date(lastTickReceivedAt).getTime() : sinceConnectionStarted;
   if(staleFor > STALL_THRESHOLD_MS){
@@ -1576,8 +1466,6 @@ setInterval(() => {
 
 // ============ web server: auth page + WebSocket relay, sharing one port ============
 const server = http.createServer(async (req, res) => {
-  // CORS: your WordPress site and this Railway app are different origins — without
-  // these headers, the browser blocks the Buy/Sell fetch() requests entirely.
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -1595,11 +1483,19 @@ const server = http.createServer(async (req, res) => {
     fyers.setRedirectUrl(REDIRECT_URI);
     const loginUrl = fyers.generateAuthCode();
 
+    const statusBanner = needsRelogin
+      ? `<p style="background:#fee; border:1px solid #c00; padding:12px; border-radius:6px;">
+           <b>⚠ TOKEN REJECTED REPEATEDLY — RELOGIN REQUIRED</b><br>
+           ${consecutiveSubscribeFailures} consecutive subscribe failures (last: ${lastSubscribeFailureReason || 'unknown'} at ${lastSubscribeFailureAt || 'unknown'}).<br>
+           Auto-retry has stopped. Log in again below to resume.
+         </p>`
+      : `<p>Status: <b>${isLive ? 'Connected and live' : 'Not connected'}</b>${consecutiveSubscribeFailures > 0 ? ` — ${consecutiveSubscribeFailures} recent subscribe failure(s), retrying with backoff` : ''}</p>`;
+
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(`
       <html><body style="font-family:sans-serif; max-width:600px; margin:40px auto;">
         <h2>Fyers Live Scanner — Daily Login</h2>
-        <p>Status: <b>${isLive ? 'Connected and live' : 'Not connected'}</b></p>
+        ${statusBanner}
         <ol>
           <li><a href="${loginUrl}" target="_blank">Click here to log in to Fyers</a></li>
           <li>After login, your browser will try to redirect and fail to load — that's expected.</li>
@@ -1635,13 +1531,12 @@ const server = http.createServer(async (req, res) => {
           res.end(`<p>Token generation failed: ${JSON.stringify(response)}. <a href="/">Try again</a></p>`);
           return;
         }
+        // A fresh login is a clean slate — clear any circuit-breaker state from before,
+        // so the new token gets a full, unhurried set of retry attempts of its own.
+        recordSubscribeSuccess();
         startFyersConnection(response.access_token);
         currentAccessToken = response.access_token;
 
-        // Sets up the TBT socket (potential 50-level depth, separate from the confirmed
-        // 5-level DepthUpdate feed) so it's ready whenever a strike gets tracked via
-        // /track-strike — stored globally so it's reused across strike changes rather
-        // than reconnecting every time.
         try{
           const FyersTbtSocket = require('fyers-api-v3/tbtsocket/tbtSocket.js');
           const tbtFullToken = `${APP_ID}:${response.access_token}`;
@@ -1704,7 +1599,6 @@ const server = http.createServer(async (req, res) => {
         const order = JSON.parse(body);
         const { symbol, side, qty, orderType, limitPrice } = order;
 
-        // basic validation — reject anything malformed before it reaches Fyers
         if (!symbol || !state[symbol]) throw new Error('Unknown or missing symbol');
         if (side !== 'BUY' && side !== 'SELL') throw new Error('side must be BUY or SELL');
         const qtyNum = parseInt(qty);
@@ -1770,7 +1664,7 @@ const server = http.createServer(async (req, res) => {
 
         const chainResponse = await fyers.getOptionChain({
           symbol: 'NSE:NIFTY50-INDEX',
-          strikecount: 30, // wide enough net that our requested strike is almost certainly in it
+          strikecount: 30,
           timestamp: ''
         });
         if (chainResponse.s !== 'ok' && chainResponse.code !== 200) {
@@ -1785,7 +1679,6 @@ const server = http.createServer(async (req, res) => {
 
         console.log(`Tracking strike ${strikeNum}: CE=${matchCE.symbol}, PE=${matchPE.symbol}`);
 
-        // unsubscribe from any previously-tracked strike's symbols first
         if (trackedStrikeSymbols.ce || trackedStrikeSymbols.pe) {
           try {
             fyersSocket.unsubscribe([trackedStrikeSymbols.ce, trackedStrikeSymbols.pe].filter(Boolean), 'DepthUpdate');
@@ -1795,12 +1688,8 @@ const server = http.createServer(async (req, res) => {
         trackedStrikeSymbols = { ce: matchCE.symbol, pe: matchPE.symbol, strike: strikeNum };
         trackedStrikeDepth = { ce: null, pe: null };
 
-        // subscribe on the regular (confirmed-working, 5-level) feed
         fyersSocket.subscribe([matchCE.symbol, matchPE.symbol], 'DepthUpdate');
 
-        // also try the TBT (potential 50-level) feed for the same two symbols, on the
-        // shared TBT socket set up at login — reused across strike changes rather than
-        // reconnecting each time
         if (currentTbtSocket) {
           try {
             currentTbtSocket.subscribe([matchCE.symbol, matchPE.symbol], 1, 'depth');
@@ -1895,17 +1784,28 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/status' && req.method === 'GET') {
+    // Lightweight JSON status endpoint — useful for checking circuit-breaker state
+    // without loading the full HTML login page.
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      isLive,
+      lastTickReceivedAt,
+      needsRelogin,
+      consecutiveSubscribeFailures,
+      lastSubscribeFailureAt,
+      lastSubscribeFailureReason,
+      nextBackoffSeconds: needsRelogin ? null : Math.round(currentBackoffMs()/1000),
+    }));
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
 
 const wss = new WebSocket.Server({ server, path: '/live' });
 
-// For each symbol, resolves what should actually be DISPLAYED for each half right
-// now: today's own locked value once it's available, falling back to yesterday's
-// persisted value until then. This fallback logic lives server-side so every
-// connected page just displays whatever it receives, rather than each page
-// re-implementing the same "which value wins" decision independently.
 function buildHalfDayLevels(){
   const result = {};
   HALF_DAY_SYMBOLS.forEach(symbol => {
@@ -1921,13 +1821,11 @@ function buildHalfDayLevels(){
   return result;
 }
 
-// Builds one row per (index, relative position, type), sorted ATM-5 through
-// ATM+5 for clean table rendering — {NIFTY: [...11 rows CE + 11 rows PE...], ...}
 const RELATIVE_POS_ORDER = [-5,-4,-3,-2,-1,0,1,2,3,4,5].map(n => n === 0 ? 'ATM' : (n > 0 ? `ATM+${n}` : `ATM${n}`));
 
 function buildMultiStrikeHalfDayLevels(){
   const result = { NIFTY: [], BANKNIFTY: [], SENSEX: [] };
-  const bySymbol = {}; // "INDEX_RELPOS_TYPE" -> {strike, firstHalf, firstHalfIsToday, secondHalf, secondHalfIsToday}
+  const bySymbol = {};
 
   multiStrikeSymbolList.forEach(symbol => {
     const meta = multiStrikeMeta[symbol];
@@ -1940,7 +1838,7 @@ function buildMultiStrikeHalfDayLevels(){
       firstHalfIsToday: !!firstHalfLocked[symbol],
       secondHalf: secondHalfLocked[symbol] || (yData && yData.secondHalf) || null,
       secondHalfIsToday: !!secondHalfLocked[symbol],
-      first5Min: first5MinLocked[symbol] || null, // for X/Y/Z auto-fill — ATM row's own first-5-min O/H/L/C
+      first5Min: first5MinLocked[symbol] || null,
     };
   });
 
@@ -1985,7 +1883,15 @@ function buildPayload(){
     halfDayLevels: buildHalfDayLevels(),
     multiStrikeHalfDayLevels: buildMultiStrikeHalfDayLevels(),
     trackedStrike: trackedStrikeSymbols,
-    trackedStrikeDepth
+    trackedStrikeDepth,
+    // circuit-breaker status, so the browser tool can show a clear "needs relogin"
+    // banner instead of just quietly showing a stale feed
+    connectionHealth: {
+      needsRelogin,
+      consecutiveSubscribeFailures,
+      lastSubscribeFailureAt,
+      lastSubscribeFailureReason,
+    }
   };
 }
 
@@ -1997,7 +1903,7 @@ wss.on('connection', (ws, req) => {
     return;
   }
   console.log('Browser tool connected to relay.');
-  ws.send(JSON.stringify(buildPayload())); // includes full slotHistory so far today
+  ws.send(JSON.stringify(buildPayload()));
 });
 
 function broadcastScreeners() {
@@ -2007,9 +1913,6 @@ function broadcastScreeners() {
   });
 }
 
-// throttle broadcasts to at most once per second — without this, active market hours
-// (Fyers can send 1000+ ticks/sec) would trigger a full computeScreeners() + JSON.stringify
-// + broadcast on every single tick, which is almost certainly what caused the OOM crashes.
 let broadcastPending = false;
 function scheduleBroadcast() {
   if (broadcastPending) return;
