@@ -1553,7 +1553,14 @@ const server = http.createServer(async (req, res) => {
         // Fyers' REST API now, right after login, so EMA20/RSI14/ADX14/SuperTrend on
         // those two timeframes are accurate from the start instead of slowly building
         // up live all day. Runs in the background — doesn't block the login response.
-        trendScanner.backfillHistory(APP_ID, response.access_token, symbols)
+        // Uses the same fyersModel SDK pattern as place-order/track-strike below
+        // (rather than hand-rolled HTTP) so the correct endpoint/auth handling is
+        // reused instead of duplicated — see trend_scanner.js's 2026-08-16 fix notes
+        // for why this replaced an earlier version that could hang indefinitely.
+        const fyersForHistory = new fyersModel({ path: __dirname, enableLogging: false });
+        fyersForHistory.setAppId(APP_ID);
+        fyersForHistory.setAccessToken(response.access_token);
+        trendScanner.backfillHistory(fyersForHistory, symbols)
           .then(() => console.log('Trend scanner: history backfill complete.'))
           .catch(err => console.log('Trend scanner backfill failed:', err.message));
 
