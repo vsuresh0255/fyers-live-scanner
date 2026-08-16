@@ -33,8 +33,13 @@
  *      const trendScanner = require('./trend_scanner.js');
  *
  * 2. After a successful login in /submit-auth-code, right after
- *    startFyersConnection(response.access_token) is called, add:
- *      trendScanner.backfillHistory(APP_ID, response.access_token, symbols)
+ *    startFyersConnection(response.access_token) is called, build a
+ *    fyersModel instance the same way place-order/track-strike already do
+ *    (setAppId + setAccessToken), then add:
+ *      const fyersForHistory = new fyersModel({ path: __dirname, enableLogging: false });
+ *      fyersForHistory.setAppId(APP_ID);
+ *      fyersForHistory.setAccessToken(response.access_token);
+ *      trendScanner.backfillHistory(fyersForHistory, symbols)
  *        .then(() => console.log('Trend scanner: history backfill complete.'))
  *        .catch(err => console.log('Trend scanner backfill failed:', err.message));
  *
@@ -53,7 +58,8 @@
  * trading day automatically, the same way the rest of server.js does.
  */
 
-const https = require('https');
+// (no https require needed — REST history calls now go through the caller's
+// fyersModel SDK instance, see backfillHistory() below)
 
 // ============ config ============
 const EMA_PERIOD = 20;
@@ -385,36 +391,52 @@ function processTick(symbol, tick){
 }
 
 // ============ REST history backfill (daily + today's 15-min) ============
-function fyersHistoryRequest(accessToken, appId, symbol, resolution, rangeFrom, rangeTo){
-  return new Promise((resolve) => {
-    const path = `/data/history?symbol=${encodeURIComponent(symbol)}&resolution=${resolution}&date_format=0&range_from=${rangeFrom}&range_to=${rangeTo}&cont_flag=1`;
-    const options = {
-      hostname: 'api-t1.fyers.in',
-      path,
-      method: 'GET',
-      headers: { 'Authorization': `${appId}:${accessToken}` },
-    };
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
-        try{ resolve(JSON.parse(data)); }
-        catch(e){ resolve({ s: 'error', message: 'parse failure' }); }
-      });
-    });
-    req.on('error', () => resolve({ s: 'error', message: 'request failed' }));
-    req.end();
-  });
+// 2026-08-16 fix: this originally made its own raw https.request() calls to a
+// guessed Fyers REST host/path, with NO timeout — if that connection ever
+// stalled (wrong host, network hiccup, anything), the returned Promise simply
+// never resolved, freezing the entire sequential 210-symbol backfill loop
+// forever with no error and no completion message. That's exactly what
+// happened in production (confirmed: neither "backfill complete" nor
+// "backfill failed" ever printed, even 13+ minutes after login).
+//
+// Fix: use the SAME fyersModel SDK instance server.js already uses
+// successfully elsewhere (getOptionChain, place_order) instead of hand-rolled
+// HTTP — the SDK owns the correct endpoint/auth details, so this is no longer
+// guesswork. AND wrap every single call in an explicit hard timeout via
+// Promise.race, so even an SDK-level stall can never hang the loop again —
+// worst case, one symbol's backfill is skipped and logged, and the loop moves
+// on to the next symbol rather than freezing entirely.
+const HISTORY_CALL_TIMEOUT_MS = 15000;
+
+function withTimeout(promise, ms, label){
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve({ s: 'error', message: `timed out after ${ms}ms (${label})` }), ms)),
+  ]);
 }
 
 function sleep(ms){ return new Promise(resolve => setTimeout(resolve, ms)); }
+
+// `fyers` is an already-configured fyersModel instance (appId + access token
+// set) — pass in the same object server.js builds for getOptionChain/place_order,
+// so this reuses proven-working auth/endpoint handling instead of duplicating it.
+async function fetchOneHistory(fyers, symbol, resolution, rangeFrom, rangeTo){
+  const data = { symbol, resolution, date_format: '0', range_from: String(rangeFrom), range_to: String(rangeTo), cont_flag: '1' };
+  try{
+    const resp = await withTimeout(fyers.history(data), HISTORY_CALL_TIMEOUT_MS, `${symbol} ${resolution}`);
+    return resp;
+  } catch(err){
+    return { s: 'error', message: err.message };
+  }
+}
 
 // Backfills ~60 daily candles and today's 15-min candles-so-far, for every
 // symbol, sequentially with a small delay to stay clear of rate limits.
 // Call this once, right after a successful daily login (see wiring notes
 // at the top of this file). Safe to call again on a relogin — it just
-// re-populates the same arrays.
-async function backfillHistory(appId, accessToken, symbols){
+// re-populates the same arrays. Never throws — logs per-symbol failures and
+// keeps going, since one bad symbol shouldn't block the other 209.
+async function backfillHistory(fyers, symbols){
   const nowSeconds = Math.floor(Date.now()/1000);
   const sixtyDaysAgo = nowSeconds - 60*24*60*60;
 
@@ -424,29 +446,39 @@ async function backfillHistory(appId, accessToken, symbols){
   const marketOpenIstToday = Math.floor(istNow/86400)*86400 + 9*3600 + 15*60;
   const todayRangeFrom = marketOpenIstToday - istOffsetSeconds;
 
+  let dailyOkCount = 0, dailyFailCount = 0, m15OkCount = 0, m15FailCount = 0;
+
   for(const symbol of symbols){
     // daily candles
-    const dailyResp = await fyersHistoryRequest(accessToken, appId, symbol, 'D', sixtyDaysAgo, nowSeconds);
+    const dailyResp = await fetchOneHistory(fyers, symbol, 'D', sixtyDaysAgo, nowSeconds);
     if(dailyResp && dailyResp.s === 'ok' && Array.isArray(dailyResp.candles)){
       ensureCandleStore('D', symbol);
       candles['D'][symbol] = dailyResp.candles.map(c => ({
         time: c[0], open: c[1], high: c[2], low: c[3], close: c[4],
       })).slice(-MAX_CANDLES);
+      dailyOkCount++;
+    } else {
+      dailyFailCount++;
     }
     await sleep(BACKFILL_DELAY_MS);
 
     // today's 15-min candles so far (only meaningful once the market has been open a while)
     if(nowSeconds > todayRangeFrom){
-      const m15Resp = await fyersHistoryRequest(accessToken, appId, symbol, '15', todayRangeFrom, nowSeconds);
+      const m15Resp = await fetchOneHistory(fyers, symbol, '15', todayRangeFrom, nowSeconds);
       if(m15Resp && m15Resp.s === 'ok' && Array.isArray(m15Resp.candles)){
         ensureCandleStore('15m', symbol);
         candles['15m'][symbol] = m15Resp.candles.map(c => ({
           time: c[0], open: c[1], high: c[2], low: c[3], close: c[4],
         })).slice(-MAX_CANDLES);
+        m15OkCount++;
+      } else {
+        m15FailCount++;
       }
       await sleep(BACKFILL_DELAY_MS);
     }
   }
+
+  console.log(`Trend scanner backfill detail: daily ${dailyOkCount} ok / ${dailyFailCount} failed, 15m ${m15OkCount} ok / ${m15FailCount} failed (out of ${symbols.length} symbols).`);
 }
 
 // ============ building the scanner payload ============
