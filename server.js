@@ -34,6 +34,16 @@
  * row, auto-retry stops entirely and the app sets needsRelogin = true, shown
  * clearly on the status page — instead of silently spinning forever. The
  * counters reset the moment a real tick comes in.
+ *
+ * --- TREND SCANNER WIRING (2026-08 addition) ---
+ * trend_scanner.js must be uploaded alongside this file (same folder). It
+ * builds 5-min/15-min/Daily candles from the same live ticks this file
+ * already receives, computes EMA20/RSI14/ADX14/SuperTrend/VWAP/Pivots per
+ * symbol, and classifies Bullish/Bearish only when every indicator agrees.
+ * See trend_scanner.js's own header comment for the full rule set. Four
+ * hooks tie it in below: the require() near the top, a backfillHistory()
+ * call right after daily login succeeds, a processTick() call inside the
+ * tick handler, and a trendScanner key added to buildPayload()'s output.
  */
 
 const fs = require('fs');
@@ -50,6 +60,7 @@ const WebSocket = require('ws');
 global.https = require('https');
 
 const { fyersModel, fyersDataSocket } = require('fyers-api-v3');
+const trendScanner = require('./trend_scanner.js'); // requires trend_scanner.js to be uploaded in this same folder
 
 // Safety net: without this, ANY uncaught exception — including ones thrown deep inside
 // Fyers' own SDK code that we can't directly control (e.g. a race condition during
@@ -1394,6 +1405,7 @@ function startFyersConnection(accessToken) {
       lastTickReceivedAt = new Date().toISOString();
       recordSubscribeSuccess(); // a real tick proves the token/subscribe is genuinely working — clear the failure/backoff state
       scheduleBroadcast();
+      trendScanner.processTick(symbol, tick); // feed the trend scanner's candle builder / VWAP accumulator
     }
 
     if (tick && tick.type === 'dp' && symbol) {
@@ -1536,6 +1548,14 @@ const server = http.createServer(async (req, res) => {
         recordSubscribeSuccess();
         startFyersConnection(response.access_token);
         currentAccessToken = response.access_token;
+
+        // Backfill the trend scanner's daily + today's 15-min candle history via
+        // Fyers' REST API now, right after login, so EMA20/RSI14/ADX14/SuperTrend on
+        // those two timeframes are accurate from the start instead of slowly building
+        // up live all day. Runs in the background — doesn't block the login response.
+        trendScanner.backfillHistory(APP_ID, response.access_token, symbols)
+          .then(() => console.log('Trend scanner: history backfill complete.'))
+          .catch(err => console.log('Trend scanner backfill failed:', err.message));
 
         try{
           const FyersTbtSocket = require('fyers-api-v3/tbtsocket/tbtSocket.js');
@@ -1884,6 +1904,7 @@ function buildPayload(){
     multiStrikeHalfDayLevels: buildMultiStrikeHalfDayLevels(),
     trackedStrike: trackedStrikeSymbols,
     trackedStrikeDepth,
+    trendScanner: trendScanner.getScannerPayload(state),
     // circuit-breaker status, so the browser tool can show a clear "needs relogin"
     // banner instead of just quietly showing a stale feed
     connectionHealth: {
