@@ -490,6 +490,14 @@ async function backfillHistory(fyers, symbols){
         m15OkCount++;
       } else {
         m15FailCount++;
+        // 2026-08-16 diagnostic: 15-min backfill was failing for ALL 210 symbols
+        // while daily (same mechanism, different resolution value) succeeded for
+        // all 210 — logging the raw response from the FIRST failure only (not all
+        // 210, to avoid spamming the log) so we can see Fyers' actual error text
+        // instead of guessing at resolution-code values blindly.
+        if(m15FailCount === 1){
+          console.log(`Trend scanner backfill: sample 15m failure for ${symbol} — raw response:`, JSON.stringify(m15Resp));
+        }
       }
       await sleep(BACKFILL_DELAY_MS);
     }
