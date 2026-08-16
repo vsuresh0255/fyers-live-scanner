@@ -420,10 +420,15 @@ function sleep(ms){ return new Promise(resolve => setTimeout(resolve, ms)); }
 // `fyers` is an already-configured fyersModel instance (appId + access token
 // set) — pass in the same object server.js builds for getOptionChain/place_order,
 // so this reuses proven-working auth/endpoint handling instead of duplicating it.
+// 2026-08-16 fix: the real fyers-api-v3 SDK's method is named getHistory(), NOT
+// history() — the earlier version of this file called the wrong (nonexistent)
+// method name, which throws "fyers.history is not a function" every time. That
+// specific error IS correctly caught below and counted as a per-symbol failure,
+// not a crash — but it meant backfill was silently failing for every symbol.
 async function fetchOneHistory(fyers, symbol, resolution, rangeFrom, rangeTo){
   const data = { symbol, resolution, date_format: '0', range_from: String(rangeFrom), range_to: String(rangeTo), cont_flag: '1' };
   try{
-    const resp = await withTimeout(fyers.history(data), HISTORY_CALL_TIMEOUT_MS, `${symbol} ${resolution}`);
+    const resp = await withTimeout(fyers.getHistory(data), HISTORY_CALL_TIMEOUT_MS, `${symbol} ${resolution}`);
     return resp;
   } catch(err){
     return { s: 'error', message: err.message };
@@ -436,7 +441,19 @@ async function fetchOneHistory(fyers, symbol, resolution, rangeFrom, rangeTo){
 // at the top of this file). Safe to call again on a relogin — it just
 // re-populates the same arrays. Never throws — logs per-symbol failures and
 // keeps going, since one bad symbol shouldn't block the other 209.
+//
+// 2026-08-16: wrapped the whole body in try/catch with a full stack-trace log
+// on any unexpected failure. This function was mysteriously rejecting with
+// "symbols is not iterable" in production despite every reproduction attempt
+// (real SDK, real files, byte-identical to what shipped) coming back clean —
+// this wrapper exists so that if it happens again, the log shows exactly
+// which line threw instead of a bare one-line message with no stack.
 async function backfillHistory(fyers, symbols){
+ try {
+  if(!Array.isArray(symbols)){
+    console.log(`Trend scanner backfill: symbols argument is not an array (got ${typeof symbols}: ${JSON.stringify(symbols)}) — aborting backfill.`);
+    return;
+  }
   const nowSeconds = Math.floor(Date.now()/1000);
   const sixtyDaysAgo = nowSeconds - 60*24*60*60;
 
@@ -479,6 +496,11 @@ async function backfillHistory(fyers, symbols){
   }
 
   console.log(`Trend scanner backfill detail: daily ${dailyOkCount} ok / ${dailyFailCount} failed, 15m ${m15OkCount} ok / ${m15FailCount} failed (out of ${symbols.length} symbols).`);
+ } catch(err){
+   console.log('Trend scanner backfill — UNEXPECTED ERROR (full stack below):');
+   console.log(err.stack || err.message || err);
+   throw err; // still reject, so server.js's own .catch() logs its usual one-line summary too
+ }
 }
 
 // ============ building the scanner payload ============
