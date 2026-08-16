@@ -1,4 +1,4 @@
-// BUILD-MARKER-A1/**
+/**
  * Trend Scanner module
  * =====================
  * A self-contained addition to the existing Railway relay (server.js). Builds
