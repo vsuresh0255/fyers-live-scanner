@@ -290,7 +290,7 @@ function checkAndRecordRoundNumberSnapshot(){
 
 const SCREENER_SCAN_TIME_MINUTES = 9 * 60 + 21;
 
-let screenerScanResults = { openlow: null, openhigh: null, gapneutral: null };
+let screenerScanResults = { openlow: null, openhigh: null, gapneutral: null, openhighsimple: null, openlowyestlow: null, openlowsimple: null };
 let screenerScanDone = false;
 let screenerScanDateKey = null;
 let screenerScanTimestamp = null;
@@ -301,7 +301,7 @@ function checkAndRunScreenerScan(){
   if(screenerScanDateKey !== dateKey){
     screenerScanDateKey = dateKey;
     screenerScanDone = false;
-    screenerScanResults = { openlow: null, openhigh: null, gapneutral: null };
+    screenerScanResults = { openlow: null, openhigh: null, gapneutral: null, openhighsimple: null, openlowyestlow: null, openlowsimple: null };
     screenerScanTimestamp = null;
   }
 
@@ -310,15 +310,18 @@ function checkAndRunScreenerScan(){
     screenerScanResults.openlow = snap.openEqLow;
     screenerScanResults.openhigh = snap.openEqHigh;
     screenerScanResults.gapneutral = snap.gapNeutral;
+    screenerScanResults.openhighsimple = snap.openEqHighSimple;
+    screenerScanResults.openlowyestlow = snap.openEqLowYestLow;
+    screenerScanResults.openlowsimple = snap.openEqLowSimple;
     screenerScanDone = true;
     screenerScanTimestamp = timeLabel();
-    console.log(`Screener scan locked at ${screenerScanTimestamp} — Open=Low: ${screenerScanResults.openlow.length}, Open=High: ${screenerScanResults.openhigh.length}, Gap-Neutral: ${screenerScanResults.gapneutral.length} symbols.`);
+    console.log(`Screener scan locked at ${screenerScanTimestamp} — Open=Low: ${screenerScanResults.openlow.length}, Open=High: ${screenerScanResults.openhigh.length}, Gap-Neutral: ${screenerScanResults.gapneutral.length}, Open=High(simple): ${screenerScanResults.openhighsimple.length}, Open=Low(simple): ${screenerScanResults.openlowsimple.length}, Open=Low vs Yest-Low: ${screenerScanResults.openlowyestlow.length} symbols.`);
     saveScreenerScanResults();
   }
 }
 
 function computeScreenersUnrestricted() {
-  const openEqLow = [], openEqHigh = [], gapNeutral = [];
+  const openEqLow = [], openEqHigh = [], gapNeutral = [], openEqHighSimple = [], openEqLowYestLow = [], openEqLowSimple = [];
   Object.keys(state).forEach(symbol => {
     const s = state[symbol];
     if (s.open === null || s.high === null || s.low === null) return;
@@ -347,8 +350,46 @@ function computeScreenersUnrestricted() {
       }
     }
     if (s.prevClose !== null && Math.abs(s.open - s.prevClose) <= EPS) gapNeutral.push({ symbol, open: s.open, prevClose: s.prevClose, ltp: s.ltp });
+
+    // Open=High, no yesterday comparison at all — just "did the first 5 min never
+    // trade above the open" on its own. Doesn't need yesterdaySnapshot to exist,
+    // so this can populate even before a "yesterday" snapshot has been captured.
+    if (first5Min) {
+      const openEqualsFirst5MinHigh = Math.abs(s.open - first5Min.high) <= EPS;
+      if (openEqualsFirst5MinHigh) {
+        openEqHighSimple.push({
+          symbol, first5MinOpen: s.open, first5MinHigh: first5Min.high,
+          first5MinClose: first5Min.close, ltp: s.ltp,
+        });
+      }
+
+      // Reciprocal of the above: Open=Low, no yesterday comparison — "did the
+      // first 5 min never trade below the open" on its own.
+      const openEqualsFirst5MinLowSimple = Math.abs(s.open - first5Min.low) <= EPS;
+      if (openEqualsFirst5MinLowSimple) {
+        openEqLowSimple.push({
+          symbol, first5MinOpen: s.open, first5MinLow: first5Min.low,
+          first5MinClose: first5Min.close, ltp: s.ltp,
+        });
+      }
+    }
+
+    // Open=Low, but compared against yesterday's LOW instead of yesterday's HIGH —
+    // a looser bullish threshold than the openEqLow screener above (that one
+    // requires closing above yesterday's entire range; this only requires
+    // closing above yesterday's low, so more symbols will typically qualify).
+    if (first5Min && yest) {
+      const openEqualsFirst5MinLow = Math.abs(s.open - first5Min.low) <= EPS;
+      const closedAboveYesterdayLow = first5Min.close > yest.dayLow;
+      if (openEqualsFirst5MinLow && closedAboveYesterdayLow) {
+        openEqLowYestLow.push({
+          symbol, first5MinOpen: s.open, first5MinLow: first5Min.low,
+          first5MinClose: first5Min.close, yesterdayLow: yest.dayLow, ltp: s.ltp,
+        });
+      }
+    }
   });
-  return { openEqLow, openEqHigh, gapNeutral };
+  return { openEqLow, openEqHigh, gapNeutral, openEqHighSimple, openEqLowYestLow, openEqLowSimple };
 }
 
 function buildLockedScreenerRows(key){
@@ -357,11 +398,123 @@ function buildLockedScreenerRows(key){
   return frozen.map(r => ({
     ...r,
     ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
+    dayHigh: (state[r.symbol] && state[r.symbol].high !== null) ? state[r.symbol].high : null,
+    dayLow: (state[r.symbol] && state[r.symbol].low !== null) ? state[r.symbol].low : null,
     matchedAt: screenerScanTimestamp,
   }));
 }
 
+// ============ 15-min screeners (mirrors the 5-min ones above) ============
+// Same pattern, same logic, just using the first 15 minutes (9:15-9:30) of the
+// day instead of the first 5 (9:15-9:20), and locking one minute later (9:31
+// instead of 9:21). Open=Low and Open=High are both covered — Gap-Neutral was
+// not requested for the 15-min version.
+const SCREENER_SCAN_15M_TIME_MINUTES = 9 * 60 + 31;
+
+let screenerScan15mResults = { openlow: null, openhigh: null, openhighsimple: null, openlowyestlow: null, openlowsimple: null };
+let screenerScan15mDone = false;
+let screenerScan15mDateKey = null;
+let screenerScan15mTimestamp = null;
+
+function checkAndRunScreenerScan15m(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(screenerScan15mDateKey !== dateKey){
+    screenerScan15mDateKey = dateKey;
+    screenerScan15mDone = false;
+    screenerScan15mResults = { openlow: null, openhigh: null, openhighsimple: null, openlowyestlow: null, openlowsimple: null };
+    screenerScan15mTimestamp = null;
+  }
+
+  if(!screenerScan15mDone && minutes >= SCREENER_SCAN_15M_TIME_MINUTES){
+    const snap = computeScreener15mUnrestricted();
+    screenerScan15mResults.openlow = snap.openEqLow;
+    screenerScan15mResults.openhigh = snap.openEqHigh;
+    screenerScan15mResults.openhighsimple = snap.openEqHighSimple;
+    screenerScan15mResults.openlowyestlow = snap.openEqLowYestLow;
+    screenerScan15mResults.openlowsimple = snap.openEqLowSimple;
+    screenerScan15mDone = true;
+    screenerScan15mTimestamp = timeLabel();
+    console.log(`15-min screener scan locked at ${screenerScan15mTimestamp} — Open=Low: ${screenerScan15mResults.openlow.length}, Open=High: ${screenerScan15mResults.openhigh.length}, Open=High(simple): ${screenerScan15mResults.openhighsimple.length}, Open=Low(simple): ${screenerScan15mResults.openlowsimple.length}, Open=Low vs Yest-Low: ${screenerScan15mResults.openlowyestlow.length} symbols.`);
+    saveScreenerScan15mResults();
+  }
+}
+
+function computeScreener15mUnrestricted() {
+  const openEqLow = [], openEqHigh = [], openEqHighSimple = [], openEqLowYestLow = [], openEqLowSimple = [];
+  Object.keys(state).forEach(symbol => {
+    const s = state[symbol];
+    if (s.open === null || s.high === null || s.low === null) return;
+
+    const first15Min = first15MinLocked[symbol];
+    const yest = yesterdaySnapshot[symbol];
+    if (first15Min && yest) {
+      const openEqualsFirst15MinLow = Math.abs(s.open - first15Min.low) <= EPS;
+      const closedAboveYesterdayHigh = first15Min.close > yest.dayHigh;
+      if (openEqualsFirst15MinLow && closedAboveYesterdayHigh) {
+        openEqLow.push({
+          symbol, first15MinOpen: s.open, first15MinLow: first15Min.low,
+          first15MinClose: first15Min.close, yesterdayHigh: yest.dayHigh, ltp: s.ltp,
+        });
+      }
+
+      const openEqualsFirst15MinHigh = Math.abs(s.open - first15Min.high) <= EPS;
+      const closedBelowYesterdayLow = first15Min.close < yest.dayLow;
+      if (openEqualsFirst15MinHigh && closedBelowYesterdayLow) {
+        openEqHigh.push({
+          symbol, first15MinOpen: s.open, first15MinHigh: first15Min.high,
+          first15MinClose: first15Min.close, yesterdayLow: yest.dayLow, ltp: s.ltp,
+        });
+      }
+
+      // Open=Low vs yesterday's LOW (not HIGH) — same looser-threshold variant as
+      // the 5-min version above.
+      const closedAboveYesterdayLow = first15Min.close > yest.dayLow;
+      if (openEqualsFirst15MinLow && closedAboveYesterdayLow) {
+        openEqLowYestLow.push({
+          symbol, first15MinOpen: s.open, first15MinLow: first15Min.low,
+          first15MinClose: first15Min.close, yesterdayLow: yest.dayLow, ltp: s.ltp,
+        });
+      }
+    }
+
+    // Open=High, no yesterday comparison — doesn't need yest, only first15Min.
+    if (first15Min) {
+      const openEqualsFirst15MinHigh = Math.abs(s.open - first15Min.high) <= EPS;
+      if (openEqualsFirst15MinHigh) {
+        openEqHighSimple.push({
+          symbol, first15MinOpen: s.open, first15MinHigh: first15Min.high,
+          first15MinClose: first15Min.close, ltp: s.ltp,
+        });
+      }
+
+      // Reciprocal: Open=Low, no yesterday comparison.
+      const openEqualsFirst15MinLowSimple = Math.abs(s.open - first15Min.low) <= EPS;
+      if (openEqualsFirst15MinLowSimple) {
+        openEqLowSimple.push({
+          symbol, first15MinOpen: s.open, first15MinLow: first15Min.low,
+          first15MinClose: first15Min.close, ltp: s.ltp,
+        });
+      }
+    }
+  });
+  return { openEqLow, openEqHigh, openEqHighSimple, openEqLowYestLow, openEqLowSimple };
+}
+
+function buildLockedScreener15mRows(key){
+  const frozen = screenerScan15mResults[key];
+  if(!frozen) return [];
+  return frozen.map(r => ({
+    ...r,
+    ltp: (state[r.symbol] && state[r.symbol].ltp !== null) ? state[r.symbol].ltp : r.ltp,
+    dayHigh: (state[r.symbol] && state[r.symbol].high !== null) ? state[r.symbol].high : null,
+    dayLow: (state[r.symbol] && state[r.symbol].low !== null) ? state[r.symbol].low : null,
+    matchedAt: screenerScan15mTimestamp,
+  }));
+}
+
 const FIRST_5MIN_LOCK_MINUTES = 9 * 60 + 20;
+const FIRST_15MIN_LOCK_MINUTES = 9 * 60 + 30; // 9:30 AM — end of the 9:15-9:30 window
 const PRE_MARKET_CLOSE_MINUTES = 9 * 60 + 9;
 let preMarketClose = {};
 let preMarketCloseLockedFlag = false;
@@ -389,6 +542,10 @@ const EOD_SNAPSHOT_MINUTES = 15 * 60 + 30;
 let first5MinLocked = {};
 let first5MinLockedFlag = false;
 let first5MinDateKey = null;
+
+let first15MinLocked = {};
+let first15MinLockedFlag = false;
+let first15MinDateKey = null;
 
 let yesterdaySnapshot = {};
 let eodSnapshotSavedToday = false;
@@ -535,6 +692,27 @@ function checkAndLockFirst5MinCandle(){
     });
     first5MinLockedFlag = true;
     console.log(`First-5-min candle locked for ${Object.keys(first5MinLocked).length} symbols.`);
+  }
+}
+
+// Same exact pattern as checkAndLockFirst5MinCandle — state[symbol].high/low
+// are cumulative from market open (9:15) already, so locking at 9:30 instead
+// of 9:20 naturally captures the true 9:15-9:30 range, no separate candle
+// tracking needed.
+function checkAndLockFirst15MinCandle(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(first15MinDateKey !== dateKey){
+    first15MinDateKey = dateKey;
+    first15MinLockedFlag = false;
+    first15MinLocked = {};
+  }
+  if(!first15MinLockedFlag && minutes >= FIRST_15MIN_LOCK_MINUTES){
+    Object.keys(state).forEach(symbol => {
+      const s = state[symbol];
+      if(s.high !== null && s.low !== null && s.ltp !== null && s.open !== null) first15MinLocked[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
+    });
+    first15MinLockedFlag = true;
+    console.log(`First-15-min candle locked for ${Object.keys(first15MinLocked).length} symbols.`);
   }
 }
 
@@ -906,12 +1084,24 @@ function computeScreeners() {
   const openEqLow = buildLockedScreenerRows('openlow');
   const openEqHigh = buildLockedScreenerRows('openhigh');
   const gapNeutral = buildLockedScreenerRows('gapneutral');
+  const openEqHighSimple = buildLockedScreenerRows('openhighsimple');
+  const openEqLowYestLow = buildLockedScreenerRows('openlowyestlow');
+  const openEqLowSimple = buildLockedScreenerRows('openlowsimple');
+  const openEqLow15m = buildLockedScreener15mRows('openlow');
+  const openEqHigh15m = buildLockedScreener15mRows('openhigh');
+  const openEqHighSimple15m = buildLockedScreener15mRows('openhighsimple');
+  const openEqLowYestLow15m = buildLockedScreener15mRows('openlowyestlow');
+  const openEqLowSimple15m = buildLockedScreener15mRows('openlowsimple');
 
   const withVolume = Object.entries(state).filter(([, s]) => s.volume !== null).map(([symbol, s]) => ({ symbol, volume: s.volume, ltp: s.ltp }));
   withVolume.sort((a, b) => b.volume - a.volume);
   const topCount = Math.max(1, Math.ceil(withVolume.length * 0.05));
   const volumeShockers = withVolume.slice(0, topCount);
-  return { openEqLow, openEqHigh, gapNeutral, volumeShockers, updatedAt: new Date().toISOString(), isLive, lastTickReceivedAt };
+  return {
+    openEqLow, openEqHigh, gapNeutral, openEqHighSimple, openEqLowYestLow, openEqLowSimple,
+    openEqLow15m, openEqHigh15m, openEqHighSimple15m, openEqLowYestLow15m, openEqLowSimple15m,
+    volumeShockers, updatedAt: new Date().toISOString(), isLive, lastTickReceivedAt,
+  };
 }
 
 const PERSIST_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
@@ -996,6 +1186,41 @@ function saveScreenerScanResults(){
 }
 
 loadScreenerScanResults();
+
+const SCREENER_SCAN_15M_PERSIST_FILE = path.join(PERSIST_DIR, 'screener_scan_15m.json');
+
+function loadScreenerScan15mResults(){
+  try{
+    if(!fs.existsSync(SCREENER_SCAN_15M_PERSIST_FILE)) {
+      console.log('No persisted 15-min screener scan found — will run fresh today.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(SCREENER_SCAN_15M_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted 15-min screener scan is from a previous day — will run fresh today.');
+      return;
+    }
+    screenerScan15mResults = saved.screenerScan15mResults;
+    screenerScan15mDone = saved.screenerScan15mDone;
+    screenerScan15mDateKey = saved.date;
+    screenerScan15mTimestamp = saved.screenerScan15mTimestamp;
+    console.log(`Restored today's 15-min screener scan from disk (locked at ${screenerScan15mTimestamp}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted 15-min screener scan (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveScreenerScan15mResults(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), screenerScan15mResults, screenerScan15mDone, screenerScan15mTimestamp };
+    fs.writeFileSync(SCREENER_SCAN_15M_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save 15-min screener scan to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadScreenerScan15mResults();
 
 const YESTERDAY_SNAPSHOT_FILE = path.join(PERSIST_DIR, 'yesterday_snapshot.json');
 const EARLY_EXHAUSTION_PERSIST_FILE = path.join(PERSIST_DIR, 'early_exhaustion_scan.json');
@@ -1329,6 +1554,8 @@ function recordMinuteSlot(){
   checkAndLockOpeningRanges();
   checkAndRunScreenerScan();
   checkAndLockFirst5MinCandle();
+  checkAndLockFirst15MinCandle();
+  checkAndRunScreenerScan15m();
   checkAndSaveEODSnapshot();
   checkAndRunEarlyExhaustionScan();
   checkAndRunEarlyBottomScan();
@@ -1905,6 +2132,7 @@ function buildPayload(){
     ...computeScreeners(),
     slotHistory,
     screenerScanDone, screenerScanTimestamp, screenerScanTimeTarget: SCREENER_SCAN_TIME_MINUTES,
+    screenerScan15mDone, screenerScan15mTimestamp, screenerScan15mTimeTarget: SCREENER_SCAN_15M_TIME_MINUTES,
     orb5Up: orb5.up, orb5Down: orb5.down,
     orb15Up: orb15.up, orb15Down: orb15.down,
     orb5Locked: orb5LockedFlag, orb15Locked: orb15LockedFlag,
@@ -1927,6 +2155,15 @@ function buildPayload(){
     trackedStrike: trackedStrikeSymbols,
     trackedStrikeDepth,
     trendScanner: trendScannerAvailable ? trendScanner.getScannerPayload(state) : [],
+    strongWeakScanner: trendScannerAvailable ? trendScanner.getStrongWeakPayload(state) : { strong: [], weak: [], turningWeak: [], all: [] },
+    // Full quote list for every tracked symbol (not just screener matches) —
+    // needed by tools like the Gann Square of 9 calculator, which computes
+    // levels for any symbol regardless of whether it matched any screener.
+    // Kept minimal (just symbol/ltp/prevClose) to keep payload size small
+    // across 210 symbols sent on every broadcast.
+    allQuotes: Object.entries(state).map(([symbol, s]) => ({
+      symbol, ltp: s.ltp, prevClose: s.prevClose, dayHigh: s.high, dayLow: s.low,
+    })),
     // circuit-breaker status, so the browser tool can show a clear "needs relogin"
     // banner instead of just quietly showing a stale feed
     connectionHealth: {
