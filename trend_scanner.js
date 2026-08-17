@@ -471,7 +471,7 @@ async function backfillHistory(fyers, symbols){
     if(dailyResp && dailyResp.s === 'ok' && Array.isArray(dailyResp.candles)){
       ensureCandleStore('D', symbol);
       candles['D'][symbol] = dailyResp.candles.map(c => ({
-        time: c[0], open: c[1], high: c[2], low: c[3], close: c[4],
+        time: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5] || 0,
       })).slice(-MAX_CANDLES);
       dailyOkCount++;
     } else {
@@ -575,8 +575,150 @@ function getScannerPayload(stateRef){
   return rows;
 }
 
+// ============ Strong Stocks for Intraday Scanner ============
+// Confirmed rules:
+//   - Strong: LTP > EMA(9) on 5-min candles, AND LTP is at/near today's day
+//     high OR at/near yesterday's day high.
+//   - Weak: mirror, using EMA(9) below + today's/yesterday's day LOW.
+//   - "At/near" uses a small tolerance (STRONG_WEAK_PROXIMITY_PCT below),
+//     matching the same pattern as the Round Number / Narrow CPR screeners
+//     elsewhere in this codebase — exact equality is too fleeting per-tick
+//     to be a usable signal, a small band around the level is what actually
+//     shows up ("stock is testing its high", not "stock is at the exact
+//     paisa of its high this millisecond").
+//   - List is LIVE all day (recomputed on every payload build), but each
+//     symbol's FIRST qualification during the 9:30-9:50 AM "note window" is
+//     remembered and flagged separately — matching the reference tool's
+//     guidance to specifically note the list during that window, without
+//     preventing the live view from working the rest of the day too.
+//   - "Turning Weak" (reversal / shorting candidates): a symbol whose status
+//     was Strong at the First Half boundary (12:30 PM) but is currently Weak,
+//     checked continuously once we're past 12:30. Reuses the same First
+//     Half / Second Half boundary already established elsewhere in this
+//     project (9:15-12:30 / 12:30-15:30).
+const STRONG_WEAK_EMA_PERIOD = 9;
+const STRONG_WEAK_PROXIMITY_PCT = 0.15; // "at/near" tolerance, as a % of the reference level
+const NOTE_WINDOW_START_MINUTES = 9*60 + 30;  // 9:30 AM
+const NOTE_WINDOW_END_MINUTES = 9*60 + 50;    // 9:50 AM
+const FIRST_HALF_BOUNDARY_MINUTES = 9*60 + 15 + 195; // 12:30 PM — same as the rest of the project
+
+let strongWeakDateKey = null;
+let windowFlagged = {};      // symbol -> { status: 'Strong'|'Weak', time: 'HH:MM' } — first qualification during the 9:30-9:50 window, today only
+let firstHalfStatusSnapshot = {}; // symbol -> 'Strong'|'Weak'|'Neutral' — status AT the 12:30 boundary, for reversal detection
+let firstHalfSnapshotTakenToday = false;
+
+function resetStrongWeakIfNewDay(){
+  const { dateKey } = getISTDateKeyAndMinutes();
+  if(strongWeakDateKey !== dateKey){
+    strongWeakDateKey = dateKey;
+    windowFlagged = {};
+    firstHalfStatusSnapshot = {};
+    firstHalfSnapshotTakenToday = false;
+  }
+}
+
+function isNear(value, reference, pct){
+  if(value == null || reference == null || reference === 0) return false;
+  return Math.abs(value - reference) / Math.abs(reference) * 100 <= pct;
+}
+
+// Returns 'Strong' | 'Weak' | 'Neutral' for one symbol, given its current LTP,
+// today's running day high/low (from server.js's live state), and yesterday's
+// day high/low (from the daily candle backfill).
+function classifyStrongWeak(ltp, ema9, dayHigh, dayLow, yestHigh, yestLow){
+  if(ltp == null || ema9 == null) return 'Neutral';
+
+  const nearDayHigh = dayHigh != null && isNear(ltp, dayHigh, STRONG_WEAK_PROXIMITY_PCT);
+  const nearYestHigh = yestHigh != null && (ltp >= yestHigh || isNear(ltp, yestHigh, STRONG_WEAK_PROXIMITY_PCT));
+  const nearDayLow = dayLow != null && isNear(ltp, dayLow, STRONG_WEAK_PROXIMITY_PCT);
+  const nearYestLow = yestLow != null && (ltp <= yestLow || isNear(ltp, yestLow, STRONG_WEAK_PROXIMITY_PCT));
+
+  if(ltp > ema9 && (nearDayHigh || nearYestHigh)) return 'Strong';
+  if(ltp < ema9 && (nearDayLow || nearYestLow)) return 'Weak';
+  return 'Neutral';
+}
+
+function buildOneStrongWeakRow(symbol, s, minutes, inNoteWindow){
+  const ltp = s.ltp;
+  if(ltp === null || ltp === undefined) return null;
+
+  const arr5m = candles['5m'][symbol] || [];
+  const closes5m = arr5m.map(c => c.close);
+  const ema9 = computeEMA(closes5m, STRONG_WEAK_EMA_PERIOD);
+
+  const dailyArr = candles['D'][symbol] || [];
+  const yest = dailyArr.length ? dailyArr[dailyArr.length-1] : null;
+  const yestHigh = yest ? yest.high : null;
+  const yestLow = yest ? yest.low : null;
+  const yestVolume = yest ? yest.volume : null;
+
+  const status = classifyStrongWeak(ltp, ema9, s.high, s.low, yestHigh, yestLow);
+
+  // remember the FIRST time this symbol qualifies as Strong/Weak during the
+  // 9:30-9:50 note window specifically — once set today, it doesn't get
+  // overwritten again even if status flips later in the window or the day
+  if(inNoteWindow && (status === 'Strong' || status === 'Weak') && !windowFlagged[symbol]){
+    windowFlagged[symbol] = { status, time: timeLabel() };
+  }
+
+  // snapshot status at the 12:30 First Half boundary, once per day
+  if(!firstHalfSnapshotTakenToday && minutes >= FIRST_HALF_BOUNDARY_MINUTES){
+    firstHalfStatusSnapshot[symbol] = status;
+  }
+
+  const turningWeak = firstHalfStatusSnapshot[symbol] === 'Strong' && status === 'Weak' && minutes >= FIRST_HALF_BOUNDARY_MINUTES;
+
+  let volumeChangePct = null;
+  if(s.volume != null && yestVolume){
+    volumeChangePct = (s.volume - yestVolume) / yestVolume * 100;
+  }
+
+  const pivots = yest ? computeClassicPivots(yest.high, yest.low, yest.close) : null;
+  const pivotDesc = pivots ? describePivotPosition(ltp, pivots) : '—';
+
+  return {
+    symbol,
+    ltp,
+    status,
+    volumeChangePct,
+    pivots: pivotDesc,
+    dayLow: s.low, dayHigh: s.high,
+    firstFlaggedInWindow: windowFlagged[symbol] ? windowFlagged[symbol].time : null,
+    firstFlaggedStatus: windowFlagged[symbol] ? windowFlagged[symbol].status : null,
+    turningWeak,
+  };
+}
+
+// `stateRef` is server.js's live per-symbol state object, same as
+// getScannerPayload() above — passed in for the same reason (LTP, day
+// high/low, and cumulative volume all live there, not in this module).
+function getStrongWeakPayload(stateRef){
+  resetStrongWeakIfNewDay();
+  const { minutes } = getISTDateKeyAndMinutes();
+  const inNoteWindow = minutes >= NOTE_WINDOW_START_MINUTES && minutes <= NOTE_WINDOW_END_MINUTES;
+
+  const rows = [];
+  Object.keys(stateRef || {}).forEach(symbol => {
+    const row = buildOneStrongWeakRow(symbol, stateRef[symbol], minutes, inNoteWindow);
+    if(row) rows.push(row);
+  });
+
+  if(!firstHalfSnapshotTakenToday && minutes >= FIRST_HALF_BOUNDARY_MINUTES){
+    firstHalfSnapshotTakenToday = true;
+    console.log(`Strong/Weak scanner: First Half status snapshot taken for ${Object.keys(firstHalfStatusSnapshot).length} symbols at 12:30 boundary.`);
+  }
+
+  return {
+    strong: rows.filter(r => r.status === 'Strong'),
+    weak: rows.filter(r => r.status === 'Weak'),
+    turningWeak: rows.filter(r => r.turningWeak),
+    all: rows,
+  };
+}
+
 module.exports = {
   processTick,
   backfillHistory,
   getScannerPayload,
+  getStrongWeakPayload,
 };
