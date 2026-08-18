@@ -614,7 +614,7 @@ let firstHalfLockedFlag = false;
 let secondHalfLockedFlag = false;
 
 const STRIKE_INTERVALS = { NIFTY: 50, BANKNIFTY: 100, SENSEX: 100 };
-const STRIKE_TRACK_RANGE = 10; // was 5 — widened so a manually-entered pre-market close on the ISP Selector page (which can differ from the LTP this server used as its own ATM anchor) is much more likely to still land inside the tracked window
+const STRIKE_TRACK_RANGE = 20; // was 10, originally 5 — widened further since the server's ATM anchor still can't know what price a user manually enters on the ISP Selector page (that entry is client-side only, never sent back here) — this is the honest, reliable safety net regardless of whether pre-market ticks stream that day
 const NSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/NSE_FO.csv';
 const BSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/BSE_FO.csv';
 
@@ -683,13 +683,30 @@ async function discoverAndSubscribeMultiStrikes(){
     try{ bseCsv = await fetchUrl(BSE_SYMBOL_MASTER_URL); }
     catch(e){ console.log('Could not fetch BSE symbol master (SENSEX strikes will be skipped):', e.message); }
 
+    // ATM anchor: prefer the captured pre-market close over the live LTP at
+    // whatever moment this function happens to run. This function only
+    // fires once all three indices have a valid LTP (the notReady check
+    // above), which is usually a little INTO the regular session, not at
+    // 9:08 AM pre-market close — if the index gapped between those two
+    // moments, anchoring to the later live price silently drifts this
+    // server's own tracked strike range away from whatever pre-market
+    // price the ISP Selector page's manual entry is based on, no matter
+    // how wide STRIKE_TRACK_RANGE is set. Anchoring to the SAME captured
+    // pre-market value (when available) removes that mismatch at the
+    // source instead of just padding around it. Falls back to live LTP if
+    // pre-market wasn't captured that day (matches the same "unconfirmed"
+    // caveat already noted on the ISP Selector page itself).
+    function atmAnchorPrice(sym){
+      return (preMarketClose && preMarketClose[sym] != null) ? preMarketClose[sym] : state[sym].ltp;
+    }
+
     let meta = {};
     ['NIFTY', 'BANKNIFTY'].forEach(sym => {
-      const atm = Math.round(state[sym].ltp / STRIKE_INTERVALS[sym]) * STRIKE_INTERVALS[sym];
+      const atm = Math.round(atmAnchorPrice(sym) / STRIKE_INTERVALS[sym]) * STRIKE_INTERVALS[sym];
       Object.assign(meta, parseStrikesFromCsv(nseCsv, sym, atm, STRIKE_INTERVALS[sym]));
     });
     if(bseCsv){
-      const atm = Math.round(state.SENSEX.ltp / STRIKE_INTERVALS.SENSEX) * STRIKE_INTERVALS.SENSEX;
+      const atm = Math.round(atmAnchorPrice('SENSEX') / STRIKE_INTERVALS.SENSEX) * STRIKE_INTERVALS.SENSEX;
       Object.assign(meta, parseStrikesFromCsv(bseCsv, 'SENSEX', atm, STRIKE_INTERVALS.SENSEX));
     }
 
