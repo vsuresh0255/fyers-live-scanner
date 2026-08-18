@@ -93,6 +93,14 @@ function getISTDateKeyAndMinutes(){
   return { dateKey, minutes, epochSeconds };
 }
 
+// "HH:MM" for the current IST time — a local equivalent of server.js's own
+// timeLabel(), since that function lives in server.js and isn't available
+// to this module.
+function timeLabel(){
+  const { minutes } = getISTDateKeyAndMinutes();
+  return `${String(Math.floor(minutes/60)).padStart(2,'0')}:${String(minutes%60).padStart(2,'0')}`;
+}
+
 function bucketStart(epochSeconds, timeframeSeconds){
   return Math.floor(epochSeconds / timeframeSeconds) * timeframeSeconds;
 }
@@ -344,7 +352,7 @@ function ensureCandleStore(timeframe, symbol){
   if(!candles[timeframe][symbol]) candles[timeframe][symbol] = [];
 }
 
-function updateIntradayCandle(timeframe, timeframeSeconds, symbol, price, epochSeconds){
+function updateIntradayCandle(timeframe, timeframeSeconds, symbol, price, epochSeconds, cumulativeVolume){
   ensureCandleStore(timeframe, symbol);
   const bStart = bucketStart(epochSeconds, timeframeSeconds);
   const cur = building[timeframe][symbol];
@@ -352,14 +360,25 @@ function updateIntradayCandle(timeframe, timeframeSeconds, symbol, price, epochS
   if(!cur || cur.time !== bStart){
     // a new bucket started — the previous in-progress candle (if any) is now closed
     if(cur){
-      candles[timeframe][symbol].push(cur);
+      // this candle's own volume = cumulative volume at close minus cumulative
+      // volume at the moment this candle started, i.e. how much traded DURING
+      // this specific candle (not the running day total)
+      const candleVolume = (cur.lastCumVolume != null && cur.startCumVolume != null)
+        ? Math.max(0, cur.lastCumVolume - cur.startCumVolume)
+        : null;
+      candles[timeframe][symbol].push({ time: cur.time, open: cur.open, high: cur.high, low: cur.low, close: cur.close, volume: candleVolume });
       if(candles[timeframe][symbol].length > MAX_CANDLES) candles[timeframe][symbol].shift();
     }
-    building[timeframe][symbol] = { time: bStart, open: price, high: price, low: price, close: price };
+    building[timeframe][symbol] = {
+      time: bStart, open: price, high: price, low: price, close: price,
+      startCumVolume: cumulativeVolume != null ? cumulativeVolume : null,
+      lastCumVolume: cumulativeVolume != null ? cumulativeVolume : null,
+    };
   } else {
     cur.high = Math.max(cur.high, price);
     cur.low = Math.min(cur.low, price);
     cur.close = price;
+    if(cumulativeVolume != null) cur.lastCumVolume = cumulativeVolume;
   }
 }
 
@@ -385,8 +404,8 @@ function processTick(symbol, tick){
   if(ltp === null) return;
 
   const { epochSeconds } = getISTDateKeyAndMinutes();
-  updateIntradayCandle('5m', 300, symbol, ltp, epochSeconds);
-  updateIntradayCandle('15m', 900, symbol, ltp, epochSeconds);
+  updateIntradayCandle('5m', 300, symbol, ltp, epochSeconds, volume);
+  updateIntradayCandle('15m', 900, symbol, ltp, epochSeconds, volume);
   if(volume !== null) updateVwap(symbol, ltp, volume);
 }
 
@@ -602,10 +621,79 @@ const NOTE_WINDOW_START_MINUTES = 9*60 + 30;  // 9:30 AM
 const NOTE_WINDOW_END_MINUTES = 9*60 + 50;    // 9:50 AM
 const FIRST_HALF_BOUNDARY_MINUTES = 9*60 + 15 + 195; // 12:30 PM — same as the rest of the project
 
+// 2026-08 notification-confluence thresholds — kept as module-level constants
+// (single source of truth) so both the live notification check below AND
+// backtest_strong_weak.js reference the exact same numbers, never two
+// separately-maintained copies that could silently drift apart.
+const NOTIFY_MIN_VOLUME_RATIO = 1.8;
+const NOTIFY_RSI_BULLISH = 65;
+const NOTIFY_RSI_BEARISH = 35;
+const NOTIFY_MIN_EMA21_MARGIN_PCT = 0.3;
+const NOTIFY_MIN_VWAP_MARGIN_PCT = 0.3;
+const NOTIFY_MAX_PER_CATEGORY_PER_DAY = Infinity; // 2026-08-17: cap removed per user request — every qualifying signal notifies now, not just the first 5. Kept as a constant (rather than deleting the check entirely) so a future cap can be reintroduced just by changing this one number.
+// 2026-08-17 tightening: today's volume-so-far must exceed DOUBLE yesterday's
+// FULL day's volume (a 100%+ day-over-day increase), not just "any increase
+// at all." Deliberately the SAME threshold for both Strong and Weak — volume
+// change can never go below -100% (volume can't be negative), so a literal
+// sign-mirror for Weak would be mathematically impossible to satisfy. High
+// volume confirms conviction in EITHER direction; which direction is decided
+// by the other 5 conditions (status, RSI, EMA21%, VWAP%, pivot position).
+const NOTIFY_MIN_VOLUME_CHANGE_PCT = 100;
+
+// Pure function — given a symbol's current status/metrics, returns which
+// notification tiers (if any) it qualifies for right now. No side effects,
+// no state — this is what makes it safely reusable by both the live app
+// (where it gates an actual Telegram send) and the backtest (where it's
+// evaluated against historical data to measure how the signal performs).
+//
+// 2026-08 redesign: the original 4-factor recipe (Volume Ratio, RSI, EMA21%,
+// VWAP%) backtested at ~45-49% hit rate at every horizon tested — no better
+// than chance. This version adds two DIFFERENT kinds of confirmation rather
+// than just re-tightening the same numbers: today's volume pace vs
+// yesterday's (volumeChangePct — a day-over-day comparison, distinct from
+// Volume Ratio's candle-over-candle comparison), and price position
+// relative to the classic Pivot Point (a support/resistance level, not
+// another momentum/oscillator reading). This has NOT itself been
+// backtested yet — re-run backtest_strong_weak.js before trusting it.
+function evaluateStrongWeakConfluence({ status, turningWeak, volumeRatio, rsi, ema21Pct, vwapPct, volumeChangePct, ltp, pivotPoint }){
+  const strongConfluence = status === 'Strong'
+    && volumeRatio != null && volumeRatio >= NOTIFY_MIN_VOLUME_RATIO
+    && rsi != null && rsi > NOTIFY_RSI_BULLISH
+    && ema21Pct != null && ema21Pct >= NOTIFY_MIN_EMA21_MARGIN_PCT
+    && vwapPct != null && vwapPct >= NOTIFY_MIN_VWAP_MARGIN_PCT
+    && volumeChangePct != null && volumeChangePct > NOTIFY_MIN_VOLUME_CHANGE_PCT
+    && ltp != null && pivotPoint != null && ltp > pivotPoint;
+
+  const weakConfluence = status === 'Weak'
+    && volumeRatio != null && volumeRatio >= NOTIFY_MIN_VOLUME_RATIO
+    && rsi != null && rsi < NOTIFY_RSI_BEARISH
+    && ema21Pct != null && ema21Pct <= -NOTIFY_MIN_EMA21_MARGIN_PCT
+    && vwapPct != null && vwapPct <= -NOTIFY_MIN_VWAP_MARGIN_PCT
+    && volumeChangePct != null && volumeChangePct > NOTIFY_MIN_VOLUME_CHANGE_PCT
+    && ltp != null && pivotPoint != null && ltp < pivotPoint;
+
+  const turningWeakConfluence = !!turningWeak
+    && volumeRatio != null && volumeRatio >= NOTIFY_MIN_VOLUME_RATIO;
+
+  return { strongConfluence, weakConfluence, turningWeakConfluence };
+}
+
 let strongWeakDateKey = null;
 let windowFlagged = {};      // symbol -> { status: 'Strong'|'Weak', time: 'HH:MM' } — first qualification during the 9:30-9:50 window, today only
 let firstHalfStatusSnapshot = {}; // symbol -> 'Strong'|'Weak'|'Neutral' — status AT the 12:30 boundary, for reversal detection
 let firstHalfSnapshotTakenToday = false;
+
+// Telegram notification tracking — separate from windowFlagged (which is
+// specifically about the 9:30-9:50 note window). This tracks "has this
+// symbol EVER been notified about today, for THIS category" so a
+// notification fires exactly once per symbol per category per day, no
+// matter how many times per second getStrongWeakPayload() gets called.
+let notifiedStrong = {};
+let notifiedWeak = {};
+let notifiedTurningWeak = {};
+let strongNotifyCountToday = 0; // hard daily cap counter, independent of the per-symbol dedup above
+let weakNotifyCountToday = 0;
+let pendingNotifications = []; // messages queued for server.js to actually send via Telegram
 
 function resetStrongWeakIfNewDay(){
   const { dateKey } = getISTDateKeyAndMinutes();
@@ -614,7 +702,23 @@ function resetStrongWeakIfNewDay(){
     windowFlagged = {};
     firstHalfStatusSnapshot = {};
     firstHalfSnapshotTakenToday = false;
+    notifiedStrong = {};
+    notifiedWeak = {};
+    notifiedTurningWeak = {};
+    strongNotifyCountToday = 0;
+    weakNotifyCountToday = 0;
+    pendingNotifications = [];
   }
+}
+
+// server.js calls this after every getStrongWeakPayload() build, drains
+// whatever's queued, and actually sends each one via Telegram (network I/O
+// deliberately kept OUT of this module — trend_scanner.js only decides
+// WHAT to say, server.js owns HOW it gets sent).
+function drainPendingNotifications(){
+  const batch = pendingNotifications;
+  pendingNotifications = [];
+  return batch;
 }
 
 function isNear(value, reference, pct){
@@ -636,6 +740,22 @@ function classifyStrongWeak(ltp, ema9, dayHigh, dayLow, yestHigh, yestLow){
   if(ltp > ema9 && (nearDayHigh || nearYestHigh)) return 'Strong';
   if(ltp < ema9 && (nearDayLow || nearYestLow)) return 'Weak';
   return 'Neutral';
+}
+
+// Ratio of the most recently CLOSED 5-min candle's own traded volume to the
+// average per-candle volume across all completed candles today for this
+// symbol. >1 means the last candle traded above today's own average pace;
+// <1 means below. Needs at least 3 completed candles to be meaningful (a
+// ratio computed from only 1-2 candles is too noisy/self-referential to
+// trust) — returns null before that, same "warming up" convention used
+// elsewhere in this module.
+function computeVolumeRatio(candlesArr){
+  const withVolume = candlesArr.filter(c => c.volume != null);
+  if(withVolume.length < 3) return null;
+  const lastVolume = withVolume[withVolume.length - 1].volume;
+  const avgVolume = withVolume.reduce((sum, c) => sum + c.volume, 0) / withVolume.length;
+  if(avgVolume <= 0) return null;
+  return lastVolume / avgVolume;
 }
 
 function buildOneStrongWeakRow(symbol, s, minutes, inNoteWindow){
@@ -668,6 +788,19 @@ function buildOneStrongWeakRow(symbol, s, minutes, inNoteWindow){
 
   const turningWeak = firstHalfStatusSnapshot[symbol] === 'Strong' && status === 'Weak' && minutes >= FIRST_HALF_BOUNDARY_MINUTES;
 
+  // ---- Volume Ratio, 21 EMA %, VWAP %, RSI — computed here (moved earlier
+  // in the function) since the notification confluence check right below
+  // needs them, in addition to the table display later on ----
+  const ema21 = computeEMA(closes5m, 21);
+  const ema21Pct = (ema21 != null && ema21 > 0) ? (ltp - ema21) / ema21 * 100 : null;
+
+  const vwap = getVwap(symbol);
+  const vwapPct = (vwap != null && vwap > 0) ? (ltp - vwap) / vwap * 100 : null;
+
+  const rsi = computeRSI(closes5m, RSI_PERIOD);
+
+  const volumeRatio = computeVolumeRatio(arr5m);
+
   let volumeChangePct = null;
   if(s.volume != null && yestVolume){
     volumeChangePct = (s.volume - yestVolume) / yestVolume * 100;
@@ -675,6 +808,47 @@ function buildOneStrongWeakRow(symbol, s, minutes, inNoteWindow){
 
   const pivots = yest ? computeClassicPivots(yest.high, yest.low, yest.close) : null;
   const pivotDesc = pivots ? describePivotPosition(ltp, pivots) : '—';
+
+  // 2026-08 redesign: the original confluence recipe (EMA9/EMA21/VWAP/RSI/
+  // Volume Ratio all agreeing) backtested at ~45-49% hit rate across every
+  // horizon tested (15/30/60min and end-of-day) — statistically no better
+  // than a coin flip. Rather than just re-tightening the same numbers, this
+  // adds two DIFFERENT kinds of confirmation on top: today's volume pace
+  // vs yesterday's (volumeChangePct), and price position relative to the
+  // classic Pivot Point — a support/resistance-based signal, not another
+  // momentum/oscillator reading like the other four. Re-run
+  // backtest_strong_weak.js against this version before trusting it any
+  // more than the last one — this has NOT been backtested yet itself.
+  const { strongConfluence, weakConfluence, turningWeakConfluence } =
+    evaluateStrongWeakConfluence({
+      status, turningWeak, volumeRatio, rsi, ema21Pct, vwapPct,
+      volumeChangePct, ltp, pivotPoint: pivots ? pivots.pp : null,
+    });
+
+  // queue a one-time-per-symbol-per-day Telegram notification the moment
+  // each CONFLUENCE condition first becomes true (not just the bare
+  // status) — this check-and-mark pattern is what keeps it from re-firing
+  // every second for the rest of the day once it's fired once. The
+  // per-category counts are also capped, independent of the per-symbol
+  // dedup above (that guards against the SAME symbol repeating; this
+  // guards against too many DIFFERENT symbols in one day).
+  const timeNow = timeLabel();
+  if(strongConfluence && !notifiedStrong[symbol] && strongNotifyCountToday < NOTIFY_MAX_PER_CATEGORY_PER_DAY){
+    notifiedStrong[symbol] = true;
+    strongNotifyCountToday++;
+    pendingNotifications.push(`🟢 STRONG (confirmed) [signal #${strongNotifyCountToday} today]: ${symbol} at LTP ${ltp} — above PP ${pivots ? pivots.pp.toFixed(2) : 'N/A'}, Vol Chg +${volumeChangePct.toFixed(1)}%, Vol Ratio ${volumeRatio.toFixed(2)}x, RSI ${rsi.toFixed(1)}, EMA21 +${ema21Pct.toFixed(2)}%, VWAP +${vwapPct.toFixed(2)}% — ${timeNow}`);
+  }
+  if(weakConfluence && !notifiedWeak[symbol] && weakNotifyCountToday < NOTIFY_MAX_PER_CATEGORY_PER_DAY){
+    notifiedWeak[symbol] = true;
+    weakNotifyCountToday++;
+    pendingNotifications.push(`🔴 WEAK (confirmed) [signal #${weakNotifyCountToday} today]: ${symbol} at LTP ${ltp} — below PP ${pivots ? pivots.pp.toFixed(2) : 'N/A'}, Vol Chg +${volumeChangePct.toFixed(1)}%, Vol Ratio ${volumeRatio.toFixed(2)}x, RSI ${rsi.toFixed(1)}, EMA21 ${ema21Pct.toFixed(2)}%, VWAP ${vwapPct.toFixed(2)}% — ${timeNow}`);
+  }
+  if(turningWeakConfluence && !notifiedTurningWeak[symbol]){
+    // deliberately uncapped — already rare by construction (requires the
+    // 12:30 PM snapshot + a full reversal + volume confirmation)
+    notifiedTurningWeak[symbol] = true;
+    pendingNotifications.push(`⚠️ TURNING WEAK (confirmed): ${symbol} at LTP ${ltp} — was Strong in the first half, now Weak on Vol ${volumeRatio.toFixed(2)}x (reversal watch) — ${timeNow}`);
+  }
 
   return {
     symbol,
@@ -686,6 +860,7 @@ function buildOneStrongWeakRow(symbol, s, minutes, inNoteWindow){
     firstFlaggedInWindow: windowFlagged[symbol] ? windowFlagged[symbol].time : null,
     firstFlaggedStatus: windowFlagged[symbol] ? windowFlagged[symbol].status : null,
     turningWeak,
+    volumeRatio, ema21Pct, vwapPct, rsi,
   };
 }
 
@@ -721,4 +896,23 @@ module.exports = {
   backfillHistory,
   getScannerPayload,
   getStrongWeakPayload,
+  drainPendingNotifications,
+  // Exported specifically so backtest_strong_weak.js can reuse the EXACT
+  // same pure math/classification functions the live app uses — a backtest
+  // that reimplemented this logic separately could silently drift out of
+  // sync with production and give misleading results.
+  computeEMA,
+  computeRSI,
+  computeVolumeRatio,
+  classifyStrongWeak,
+  computeClassicPivots,
+  describePivotPosition,
+  evaluateStrongWeakConfluence,
+  NOTIFY_MIN_VOLUME_RATIO,
+  NOTIFY_RSI_BULLISH,
+  NOTIFY_RSI_BEARISH,
+  NOTIFY_MIN_EMA21_MARGIN_PCT,
+  NOTIFY_MIN_VWAP_MARGIN_PCT,
+  NOTIFY_MIN_VOLUME_CHANGE_PCT,
+  NOTIFY_MAX_PER_CATEGORY_PER_DAY,
 };
