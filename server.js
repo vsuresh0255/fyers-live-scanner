@@ -614,7 +614,7 @@ let firstHalfLockedFlag = false;
 let secondHalfLockedFlag = false;
 
 const STRIKE_INTERVALS = { NIFTY: 50, BANKNIFTY: 100, SENSEX: 100 };
-const STRIKE_TRACK_RANGE = 5;
+const STRIKE_TRACK_RANGE = 10; // was 5 — widened so a manually-entered pre-market close on the ISP Selector page (which can differ from the LTP this server used as its own ATM anchor) is much more likely to still land inside the tracked window
 const NSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/NSE_FO.csv';
 const BSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/BSE_FO.csv';
 
