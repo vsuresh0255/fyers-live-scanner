@@ -229,6 +229,18 @@ function sendTelegramMessage(text){
   req.end();
 }
 
+// Sends one Telegram message summarizing every symbol that matched an
+// Open=Low/Open=High screener at its lock moment (9:21 for 5-min, 9:31 for
+// 15-min) — a distinct emoji per screener so all four stay visually
+// distinguishable at a glance in a shared chat. Sends nothing if the list
+// is empty, to avoid a daily "0 matches" message cluttering the chat.
+function sendOpenEqScreenerAlert(label, emoji, list, lockTime){
+  if(!TELEGRAM_BOT_TOKEN || !list || list.length === 0) return;
+  const symbolLines = list.map(r => `• ${r.symbol} (LTP ${r.ltp})`).join('\n');
+  const message = `${emoji} ${label} locked at ${lockTime} — ${list.length} symbol(s):\n${symbolLines}`;
+  sendTelegramMessage(message);
+}
+
 // Called once per broadcast cycle — drains whatever Strong/Weak/Turning-Weak
 // notifications trend_scanner.js queued up since the last check, and sends
 // each one. Safe to call even when nothing's pending (drainPendingNotifications
@@ -367,6 +379,10 @@ function checkAndRunScreenerScan(){
     screenerScanTimestamp = timeLabel();
     console.log(`Screener scan locked at ${screenerScanTimestamp} — Open=Low: ${screenerScanResults.openlow.length}, Open=High: ${screenerScanResults.openhigh.length}, Gap-Neutral: ${screenerScanResults.gapneutral.length}, Open=High(simple): ${screenerScanResults.openhighsimple.length}, Open=Low(simple): ${screenerScanResults.openlowsimple.length}, Open=Low vs Yest-Low: ${screenerScanResults.openlowyestlow.length} symbols.`);
     saveScreenerScanResults();
+    sendOpenEqScreenerAlert('OPEN=LOW (5-min / "first-5min-buy-candle")', '📗', screenerScanResults.openlow, screenerScanTimestamp);
+    sendOpenEqScreenerAlert('OPEN=HIGH (5-min / "first-5min-sell-candle")', '📕', screenerScanResults.openhigh, screenerScanTimestamp);
+    sendOpenEqScreenerAlert('OPEN=LOW SIMPLE (5-min, no yesterday condition)', '🟢', screenerScanResults.openlowsimple, screenerScanTimestamp);
+    sendOpenEqScreenerAlert('OPEN=HIGH SIMPLE (5-min, no yesterday condition)', '🔴', screenerScanResults.openhighsimple, screenerScanTimestamp);
   }
 }
 
@@ -487,6 +503,10 @@ function checkAndRunScreenerScan15m(){
     screenerScan15mTimestamp = timeLabel();
     console.log(`15-min screener scan locked at ${screenerScan15mTimestamp} — Open=Low: ${screenerScan15mResults.openlow.length}, Open=High: ${screenerScan15mResults.openhigh.length}, Open=High(simple): ${screenerScan15mResults.openhighsimple.length}, Open=Low(simple): ${screenerScan15mResults.openlowsimple.length}, Open=Low vs Yest-Low: ${screenerScan15mResults.openlowyestlow.length} symbols.`);
     saveScreenerScan15mResults();
+    sendOpenEqScreenerAlert('OPEN=LOW (15-min)', '📘', screenerScan15mResults.openlow, screenerScan15mTimestamp);
+    sendOpenEqScreenerAlert('OPEN=HIGH (15-min)', '📙', screenerScan15mResults.openhigh, screenerScan15mTimestamp);
+    sendOpenEqScreenerAlert('OPEN=LOW SIMPLE (15-min, no yesterday condition)', '🔵', screenerScan15mResults.openlowsimple, screenerScan15mTimestamp);
+    sendOpenEqScreenerAlert('OPEN=HIGH SIMPLE (15-min, no yesterday condition)', '🟠', screenerScan15mResults.openhighsimple, screenerScan15mTimestamp);
   }
 }
 
