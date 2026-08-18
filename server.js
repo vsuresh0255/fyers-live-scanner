@@ -759,6 +759,7 @@ function checkAndLockFirst5MinCandle(){
     });
     first5MinLockedFlag = true;
     console.log(`First-5-min candle locked for ${Object.keys(first5MinLocked).length} symbols.`);
+    saveFirst5MinLocked();
   }
 }
 
@@ -1220,6 +1221,44 @@ function savePersistedHistory(){
 loadPersistedHistory();
 
 const SCREENER_SCAN_PERSIST_FILE = path.join(PERSIST_DIR, 'screener_scan.json');
+
+// first5MinLocked previously had NO disk persistence at all — a same-day
+// restart after 9:20 AM (e.g. a code redeploy in the afternoon) silently
+// wiped today's already-locked first-5-min candle for every symbol, with
+// no way to recover it until the following day's fresh 9:20 AM lock. This
+// follows the exact same save/restore pattern as screener_scan.json above.
+const FIRST5MIN_PERSIST_FILE = path.join(PERSIST_DIR, 'first5min_locked.json');
+
+function loadFirst5MinLocked(){
+  try{
+    if(!fs.existsSync(FIRST5MIN_PERSIST_FILE)){
+      console.log('No persisted first-5-min lock found — will lock fresh today at 9:20 AM.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(FIRST5MIN_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted first-5-min lock is from a previous day — will lock fresh today.');
+      return;
+    }
+    first5MinLocked = saved.first5MinLocked;
+    first5MinLockedFlag = saved.first5MinLockedFlag;
+    console.log(`Restored today's first-5-min candle from disk (${Object.keys(first5MinLocked).length} symbols) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted first-5-min lock (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveFirst5MinLocked(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), first5MinLocked, first5MinLockedFlag };
+    fs.writeFileSync(FIRST5MIN_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save first-5-min lock to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadFirst5MinLocked();
 
 function loadScreenerScanResults(){
   try{
