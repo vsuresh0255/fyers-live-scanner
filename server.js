@@ -91,11 +91,24 @@ const SECRET_KEY = process.env.FYERS_SECRET_KEY;
 const REDIRECT_URI = process.env.FYERS_REDIRECT_URI;
 const RELAY_TOKEN = process.env.RELAY_TOKEN;
 
+// Telegram notifications for the Strong/Weak Intraday Scanner — optional.
+// TELEGRAM_BOT_TOKEN must be set (create a bot via @BotFather on Telegram)
+// for notifications to actually send; if it's missing, the app just logs a
+// one-time notice and continues running normally with notifications off —
+// this was deliberately made non-fatal, unlike the Fyers credentials above,
+// since notifications are a nice-to-have, not core to the app working.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '-1001816364014';
+
 let currentAccessToken = null; // stored after daily login, needed for placing orders
 
 if (!APP_ID || !SECRET_KEY || !REDIRECT_URI || !RELAY_TOKEN) {
   console.error('\nMissing required environment variables. Set FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI, and RELAY_TOKEN in the Railway dashboard (Variables tab).\n');
   process.exit(1);
+}
+
+if (!TELEGRAM_BOT_TOKEN) {
+  console.log('TELEGRAM_BOT_TOKEN not set — Strong/Weak Scanner Telegram notifications are disabled. Set it in Railway Variables to enable them.');
 }
 
 const SYMBOLS_PATH = path.join(__dirname, 'symbols.json');
@@ -187,6 +200,43 @@ function pick(obj, candidates) {
     if (obj[key] !== undefined && obj[key] !== null) return obj[key];
   }
   return null;
+}
+
+// Sends one message to the configured Telegram chat via the Bot API. Fire-
+// and-forget by design (callers don't await this) — a failed/slow Telegram
+// send should never block or slow down the live tick/broadcast pipeline.
+// No-ops quietly if TELEGRAM_BOT_TOKEN isn't configured.
+function sendTelegramMessage(text){
+  if(!TELEGRAM_BOT_TOKEN) return;
+  const payload = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text });
+  const options = {
+    hostname: 'api.telegram.org',
+    path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+  };
+  const req = https.request(options, (res) => {
+    let data = '';
+    res.on('data', chunk => { data += chunk; });
+    res.on('end', () => {
+      if(res.statusCode !== 200){
+        console.log('Telegram send failed:', res.statusCode, data);
+      }
+    });
+  });
+  req.on('error', (err) => { console.log('Telegram send error:', err.message); });
+  req.write(payload);
+  req.end();
+}
+
+// Called once per broadcast cycle — drains whatever Strong/Weak/Turning-Weak
+// notifications trend_scanner.js queued up since the last check, and sends
+// each one. Safe to call even when nothing's pending (drainPendingNotifications
+// returns an empty array in that case, this is then a no-op).
+function checkAndSendStrongWeakNotifications(){
+  if(!trendScannerAvailable || !TELEGRAM_BOT_TOKEN) return;
+  const messages = trendScanner.drainPendingNotifications();
+  messages.forEach(msg => sendTelegramMessage(msg));
 }
 
 function updateStateFromTick(symbol, tick) {
@@ -1635,7 +1685,7 @@ function startFyersConnection(accessToken) {
       console.log('Subscribing to', symbols.length, 'symbols...');
       fyersSocket.subscribe(symbols);
       isLive = true;
-    }, 2000);
+    }, 6000); // was 2000ms — bumped up since even RECONNECTS (not just brand-new logins) were sometimes hitting a -15 "invalid token" rejection on the first subscribe attempt, suggesting Fyers' side needs a bit longer to fully accept a new WS session than 2s reliably provides
   });
 
   fyersSocket.on('message', tick => {
@@ -2128,6 +2178,16 @@ function buildMultiStrikeHalfDayLevels(){
 function buildPayload(){
   const orb5 = computeOrbBreakouts(5);
   const orb15 = computeOrbBreakouts(15);
+
+  // computed as a local var (not inline in the return below) so we can drain
+  // and send any queued Telegram notifications right after — this is the
+  // ONLY place getStrongWeakPayload() is called per broadcast, so it's the
+  // natural spot to also check for new Strong/Weak/Turning-Weak qualifications
+  const strongWeakPayload = trendScannerAvailable
+    ? trendScanner.getStrongWeakPayload(state)
+    : { strong: [], weak: [], turningWeak: [], all: [] };
+  checkAndSendStrongWeakNotifications();
+
   return {
     ...computeScreeners(),
     slotHistory,
@@ -2155,7 +2215,7 @@ function buildPayload(){
     trackedStrike: trackedStrikeSymbols,
     trackedStrikeDepth,
     trendScanner: trendScannerAvailable ? trendScanner.getScannerPayload(state) : [],
-    strongWeakScanner: trendScannerAvailable ? trendScanner.getStrongWeakPayload(state) : { strong: [], weak: [], turningWeak: [], all: [] },
+    strongWeakScanner: strongWeakPayload,
     // Full quote list for every tracked symbol (not just screener matches) —
     // needed by tools like the Gann Square of 9 calculator, which computes
     // levels for any symbol regardless of whether it matched any screener.
