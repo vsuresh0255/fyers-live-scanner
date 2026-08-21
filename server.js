@@ -742,14 +742,22 @@ async function discoverAndSubscribeMultiStrikes(){
     }
 
     let meta = {};
+    const atmLog = []; // collected for one clear diagnostic log line below
     ['NIFTY', 'BANKNIFTY'].forEach(sym => {
-      const atm = Math.round(atmAnchorPrice(sym) / STRIKE_INTERVALS[sym]) * STRIKE_INTERVALS[sym];
+      const anchorPrice = atmAnchorPrice(sym);
+      const anchorSource = (preMarketClose && preMarketClose[sym] != null) ? 'pre-market close' : 'live LTP';
+      const atm = Math.round(anchorPrice / STRIKE_INTERVALS[sym]) * STRIKE_INTERVALS[sym];
+      atmLog.push(`${sym}: anchor=${anchorPrice} (${anchorSource}) -> ATM=${atm}, tracked range ${atm - STRIKE_TRACK_RANGE*STRIKE_INTERVALS[sym]}-${atm + STRIKE_TRACK_RANGE*STRIKE_INTERVALS[sym]}`);
       Object.assign(meta, parseStrikesFromCsv(nseCsv, sym, atm, STRIKE_INTERVALS[sym]));
     });
     if(bseCsv){
-      const atm = Math.round(atmAnchorPrice('SENSEX') / STRIKE_INTERVALS.SENSEX) * STRIKE_INTERVALS.SENSEX;
+      const anchorPrice = atmAnchorPrice('SENSEX');
+      const anchorSource = (preMarketClose && preMarketClose.SENSEX != null) ? 'pre-market close' : 'live LTP';
+      const atm = Math.round(anchorPrice / STRIKE_INTERVALS.SENSEX) * STRIKE_INTERVALS.SENSEX;
+      atmLog.push(`SENSEX: anchor=${anchorPrice} (${anchorSource}) -> ATM=${atm}, tracked range ${atm - STRIKE_TRACK_RANGE*STRIKE_INTERVALS.SENSEX}-${atm + STRIKE_TRACK_RANGE*STRIKE_INTERVALS.SENSEX}`);
       Object.assign(meta, parseStrikesFromCsv(bseCsv, 'SENSEX', atm, STRIKE_INTERVALS.SENSEX));
     }
+    console.log('Multi-strike ATM discovery:\n  ' + atmLog.join('\n  '));
 
     multiStrikeMeta = meta;
     multiStrikeSymbolList = Object.keys(meta);
