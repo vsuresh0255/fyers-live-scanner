@@ -1047,6 +1047,7 @@ module.exports = {
   // that reimplemented this logic separately could silently drift out of
   // sync with production and give misleading results.
   computeEMA,
+  computeMACDHistogram,
   computeRSI,
   computeVolumeRatio,
   classifyStrongWeak,
