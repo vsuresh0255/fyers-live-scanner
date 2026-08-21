@@ -125,6 +125,51 @@ function computeEMA(closes, period){
   return ema;
 }
 
+// EMA as a full series (O(n), single pass) — needed for MACD's signal line,
+// which is itself an EMA of the MACD line across many points. computeEMA
+// above only returns the final value, which is right for a plain "current
+// EMA(20)" reading but would need an expensive O(n^2) re-walk if called
+// once per point just to build a series — this does it in one pass instead.
+function computeEMASeries(values, period){
+  const result = new Array(values.length).fill(null);
+  const k = 2 / (period + 1);
+  let seedSum = 0, seedCount = 0, ema = null;
+  for(let i = 0; i < values.length; i++){
+    if(values[i] === null){ result[i] = null; continue; }
+    if(ema === null){
+      seedSum += values[i];
+      seedCount++;
+      if(seedCount === period){ ema = seedSum / period; result[i] = ema; }
+    } else {
+      ema = values[i]*k + ema*(1-k);
+      result[i] = ema;
+    }
+  }
+  return result;
+}
+
+// MACD Histogram (12,26,9) — returns just the LATEST point's {macdLine,
+// signal, histogram}, computed efficiently via the series helper above
+// rather than recomputing from scratch per-point. Returns null until
+// enough history exists (needs 26 for the slower EMA, plus 9 more for the
+// signal line to have real data to smooth).
+function computeMACDHistogram(closes){
+  if(closes.length < 35) return null;
+  const ema12Series = computeEMASeries(closes, 12);
+  const ema26Series = computeEMASeries(closes, 26);
+  const macdLineSeries = closes.map((_, i) =>
+    (ema12Series[i] !== null && ema26Series[i] !== null) ? ema12Series[i] - ema26Series[i] : null
+  );
+  const signalSeries = computeEMASeries(macdLineSeries, 9);
+  const lastIdx = closes.length - 1;
+  if(macdLineSeries[lastIdx] === null || signalSeries[lastIdx] === null) return null;
+  return {
+    macdLine: macdLineSeries[lastIdx],
+    signal: signalSeries[lastIdx],
+    histogram: macdLineSeries[lastIdx] - signalSeries[lastIdx],
+  };
+}
+
 // Wilder's RSI(14) — the standard RSI smoothing method (not a simple average
 // of gains/losses), matching what every charting platform actually shows.
 function computeRSI(closes, period){
@@ -694,6 +739,7 @@ let notifiedTurningWeak = {};
 let strongNotifyCountToday = 0; // hard daily cap counter, independent of the per-symbol dedup above
 let weakNotifyCountToday = 0;
 let pendingNotifications = []; // messages queued for server.js to actually send via Telegram
+let strongWeakAlertLog = []; // { time, symbol, statusEvent: 'Strong'|'Weak', ltp, volumeChangePct, volumeRatio, ema21Pct, vwapPct, rsi, pivots, dayLow, dayHigh } — one entry per symbol per status per day, same trigger point as Telegram, for the on-page Alert Log table
 
 function resetStrongWeakIfNewDay(){
   const { dateKey } = getISTDateKeyAndMinutes();
@@ -708,6 +754,7 @@ function resetStrongWeakIfNewDay(){
     strongNotifyCountToday = 0;
     weakNotifyCountToday = 0;
     pendingNotifications = [];
+    strongWeakAlertLog = [];
   }
 }
 
@@ -837,11 +884,13 @@ function buildOneStrongWeakRow(symbol, s, minutes, inNoteWindow){
     notifiedStrong[symbol] = true;
     strongNotifyCountToday++;
     pendingNotifications.push(`🟢 STRONG (confirmed) [signal #${strongNotifyCountToday} today]: ${symbol} at LTP ${ltp} — above PP ${pivots ? pivots.pp.toFixed(2) : 'N/A'}, Vol Chg +${volumeChangePct.toFixed(1)}%, Vol Ratio ${volumeRatio.toFixed(2)}x, RSI ${rsi.toFixed(1)}, EMA21 +${ema21Pct.toFixed(2)}%, VWAP +${vwapPct.toFixed(2)}% — ${timeNow}`);
+    strongWeakAlertLog.push({ time: timeNow, symbol, statusEvent: 'Strong', ltp, volumeChangePct, volumeRatio, ema21Pct, vwapPct, rsi, pivots: pivotDesc, dayLow: s.low, dayHigh: s.high });
   }
   if(weakConfluence && !notifiedWeak[symbol] && weakNotifyCountToday < NOTIFY_MAX_PER_CATEGORY_PER_DAY){
     notifiedWeak[symbol] = true;
     weakNotifyCountToday++;
     pendingNotifications.push(`🔴 WEAK (confirmed) [signal #${weakNotifyCountToday} today]: ${symbol} at LTP ${ltp} — below PP ${pivots ? pivots.pp.toFixed(2) : 'N/A'}, Vol Chg +${volumeChangePct.toFixed(1)}%, Vol Ratio ${volumeRatio.toFixed(2)}x, RSI ${rsi.toFixed(1)}, EMA21 ${ema21Pct.toFixed(2)}%, VWAP ${vwapPct.toFixed(2)}% — ${timeNow}`);
+    strongWeakAlertLog.push({ time: timeNow, symbol, statusEvent: 'Weak', ltp, volumeChangePct, volumeRatio, ema21Pct, vwapPct, rsi, pivots: pivotDesc, dayLow: s.low, dayHigh: s.high });
   }
   if(turningWeakConfluence && !notifiedTurningWeak[symbol]){
     // deliberately uncapped — already rare by construction (requires the
@@ -888,7 +937,102 @@ function getStrongWeakPayload(stateRef){
     weak: rows.filter(r => r.status === 'Weak'),
     turningWeak: rows.filter(r => r.turningWeak),
     all: rows,
+    alertLog: strongWeakAlertLog,
   };
+}
+
+// ============================================================
+// Momentum Scanner — 8-condition mix of daily + 5-min live signals
+// ============================================================
+// Reference conditions (Market Cap dropped — no live market-cap data source
+// exists in this pipeline; relies on the existing F&O-eligible symbol
+// universe, which already skews toward larger, more liquid names):
+//   1. Price > Open Price (today, live)
+//   2. 1 Day Unusual Volume: today's volume-so-far > 2x the 20-day average
+//      daily volume (the last 20 COMPLETED days, not including today)
+//   3. RSI(14) daily >= 60
+//   4. MACD Histogram (daily) >= 0
+//   5. EMA(5) > EMA(20), daily
+//   6. EMA(20) > EMA(100), daily
+//   7. MACD Histogram (5-min) >= 0
+//   8. EMA(5) > EMA(20), 5-min
+//
+// "Daily" indicators are computed using historical daily closes WITH
+// today's live LTP appended as the still-forming current day's close —
+// matching how a live scanner actually shows daily-timeframe readings
+// updating throughout the day, not frozen at yesterday's close.
+function buildOneMomentumScannerRow(symbol, s){
+  if(s.ltp == null || s.open == null || s.volume == null) return null;
+
+  const dailyArr = candles['D'][symbol] || [];
+  const arr5m = candles['5m'][symbol] || [];
+  if(dailyArr.length < 100 || arr5m.length < 35) return null; // need 100 for daily EMA100, 35 for 5-min MACD
+
+  const dailyClosesHistorical = dailyArr.map(c => c.close);
+  const dailyClosesWithToday = [...dailyClosesHistorical, s.ltp];
+  const closes5m = arr5m.map(c => c.close);
+
+  // ---- condition 1: Price > Open ----
+  const priceAboveOpen = s.ltp > s.open;
+
+  // ---- condition 2: Unusual Volume (today vs 20-day average, excluding today) ----
+  const last20DailyVolumes = dailyArr.slice(-20).map(c => c.volume).filter(v => v != null);
+  const avg20DayVolume = last20DailyVolumes.length >= 20
+    ? last20DailyVolumes.reduce((a,b) => a+b, 0) / last20DailyVolumes.length
+    : null;
+  const volumeRatioVsAvg = avg20DayVolume ? s.volume / avg20DayVolume : null;
+  const unusualVolume = volumeRatioVsAvg !== null && volumeRatioVsAvg > 2;
+
+  // ---- conditions 3-6: daily RSI/MACD/EMA (using today's live LTP as the current day's close) ----
+  const dailyRSI = computeRSI(dailyClosesWithToday, 14);
+  const dailyMACD = computeMACDHistogram(dailyClosesWithToday);
+  const dailyEMA5 = computeEMA(dailyClosesWithToday, 5);
+  const dailyEMA20 = computeEMA(dailyClosesWithToday, 20);
+  const dailyEMA100 = computeEMA(dailyClosesWithToday, 100);
+
+  const rsiCondition = dailyRSI !== null && dailyRSI >= 60;
+  const macdDailyCondition = dailyMACD !== null && dailyMACD.histogram >= 0;
+  const emaDailyCondition = dailyEMA5 !== null && dailyEMA20 !== null && dailyEMA5 > dailyEMA20;
+  const emaLongCondition = dailyEMA20 !== null && dailyEMA100 !== null && dailyEMA20 > dailyEMA100;
+
+  // ---- conditions 7-8: 5-min MACD/EMA ----
+  const macd5m = computeMACDHistogram(closes5m);
+  const ema5_5m = computeEMA(closes5m, 5);
+  const ema20_5m = computeEMA(closes5m, 20);
+
+  const macd5mCondition = macd5m !== null && macd5m.histogram >= 0;
+  const ema5mCondition = ema5_5m !== null && ema20_5m !== null && ema5_5m > ema20_5m;
+
+  const allConditionsMet = priceAboveOpen && unusualVolume && rsiCondition
+    && macdDailyCondition && emaDailyCondition && emaLongCondition
+    && macd5mCondition && ema5mCondition;
+
+  if(!allConditionsMet) return null;
+
+  return {
+    symbol, ltp: s.ltp, open: s.open,
+    volumeRatioVsAvg, rsi: dailyRSI,
+    macdHistogramDaily: dailyMACD.histogram,
+    ema5Daily: dailyEMA5, ema20Daily: dailyEMA20, ema100Daily: dailyEMA100,
+    macdHistogram5m: macd5m.histogram,
+    ema5_5m, ema20_5m,
+  };
+}
+
+// `allowedSymbols`: optional array (or null) — when provided, only these
+// symbols are evaluated (used for the Market Cap >= 10,000 Cr proxy filter,
+// applied ONLY here, not to any other screener — see server.js's
+// momentumScannerSymbols for how this gets loaded). null/undefined means
+// "no filter, evaluate every symbol in stateRef" — the original behavior.
+function getMomentumScannerPayload(stateRef, allowedSymbols){
+  const allowedSet = allowedSymbols ? new Set(allowedSymbols) : null;
+  const rows = [];
+  Object.keys(stateRef || {}).forEach(symbol => {
+    if(allowedSet && !allowedSet.has(symbol)) return;
+    const row = buildOneMomentumScannerRow(symbol, stateRef[symbol]);
+    if(row) rows.push(row);
+  });
+  return { matches: rows };
 }
 
 module.exports = {
@@ -896,6 +1040,7 @@ module.exports = {
   backfillHistory,
   getScannerPayload,
   getStrongWeakPayload,
+  getMomentumScannerPayload,
   drainPendingNotifications,
   // Exported specifically so backtest_strong_weak.js can reuse the EXACT
   // same pure math/classification functions the live app uses — a backtest
