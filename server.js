@@ -119,6 +119,27 @@ if (!fs.existsSync(SYMBOLS_PATH)) {
 const symbols = JSON.parse(fs.readFileSync(SYMBOLS_PATH, 'utf8'));
 console.log(`Loaded ${symbols.length} symbols to track.`);
 
+// Market-cap-filtered symbol set (Nifty 500 proxy for Market Cap >= 10,000
+// Cr) — see market_cap_filter.py for how this file gets generated. OPTIONAL
+// and applies ONLY to the Momentum Scanner, not the whole app — every other
+// screener (Strong/Weak, Open=Low/High, etc.) keeps tracking the full
+// symbols.json universe as before, since only the Momentum Scanner's
+// reference conditions asked for a market-cap floor. If this file isn't
+// present, the Momentum Scanner falls back to the full symbol list with a
+// clear one-time log message, rather than silently running unfiltered.
+const MARKET_CAP_SYMBOLS_PATH = path.join(__dirname, 'symbols_marketcap_filtered.json');
+let momentumScannerSymbols = null; // null = "use the full list" (fallback)
+if (fs.existsSync(MARKET_CAP_SYMBOLS_PATH)) {
+  try {
+    momentumScannerSymbols = JSON.parse(fs.readFileSync(MARKET_CAP_SYMBOLS_PATH, 'utf8'));
+    console.log(`Loaded ${momentumScannerSymbols.length} market-cap-filtered symbols for the Momentum Scanner (from symbols_marketcap_filtered.json).`);
+  } catch (err) {
+    console.log('symbols_marketcap_filtered.json exists but failed to parse — Momentum Scanner will use the full symbol list instead:', err.message);
+  }
+} else {
+  console.log('No symbols_marketcap_filtered.json found — Momentum Scanner will use the full symbol list (run market_cap_filter.py and upload its output to apply the Market Cap >= 10,000 Cr filter).');
+}
+
 // ============ live state per symbol ============
 const state = {};
 symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null }; });
@@ -2264,6 +2285,10 @@ function buildPayload(){
     : { strong: [], weak: [], turningWeak: [], all: [] };
   checkAndSendStrongWeakNotifications();
 
+  const momentumScannerPayload = trendScannerAvailable
+    ? trendScanner.getMomentumScannerPayload(state, momentumScannerSymbols)
+    : { matches: [] };
+
   return {
     ...computeScreeners(),
     slotHistory,
@@ -2292,6 +2317,7 @@ function buildPayload(){
     trackedStrikeDepth,
     trendScanner: trendScannerAvailable ? trendScanner.getScannerPayload(state) : [],
     strongWeakScanner: strongWeakPayload,
+    momentumScanner: momentumScannerPayload,
     // Full quote list for every tracked symbol (not just screener matches) —
     // needed by tools like the Gann Square of 9 calculator, which computes
     // levels for any symbol regardless of whether it matched any screener.
