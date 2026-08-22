@@ -1035,12 +1035,49 @@ function getMomentumScannerPayload(stateRef, allowedSymbols){
   return { matches: rows };
 }
 
+// ============================================================
+// BTST Scanner — live volume-ratio side only
+// ============================================================
+// Delivery percentage isn't available server-side at all (it comes from a
+// separate NSE report the user downloads and uploads via the Setup page,
+// not from Fyers) — so this only computes the volume-ratio half of the
+// BTST backtest's two filters. The frontend page cross-references this
+// live payload against the browser's own uploaded delivery data to get
+// the final, combined qualification.
+//
+// Matches the backtest's own definition exactly: today's cumulative volume
+// so far, divided by the average of the last 10 COMPLETED daily volumes
+// (not including today).
+function buildOneBtstVolumeRow(symbol, s){
+  if(s.ltp == null || s.volume == null) return null;
+  const dailyArr = candles['D'][symbol] || [];
+  if(dailyArr.length < 10) return null;
+
+  const recentVolumes = dailyArr.slice(-10).map(c => c.volume).filter(v => v != null);
+  if(recentVolumes.length < 10) return null;
+  const avgDailyVolume = recentVolumes.reduce((a,b) => a+b, 0) / recentVolumes.length;
+  const volumeRatio = avgDailyVolume > 0 ? s.volume / avgDailyVolume : null;
+  if(volumeRatio === null) return null;
+
+  return { symbol, ltp: s.ltp, volumeRatio };
+}
+
+function getBtstVolumeRatioPayload(stateRef){
+  const rows = [];
+  Object.keys(stateRef || {}).forEach(symbol => {
+    const row = buildOneBtstVolumeRow(symbol, stateRef[symbol]);
+    if(row) rows.push(row);
+  });
+  return { rows };
+}
+
 module.exports = {
   processTick,
   backfillHistory,
   getScannerPayload,
   getStrongWeakPayload,
   getMomentumScannerPayload,
+  getBtstVolumeRatioPayload,
   drainPendingNotifications,
   // Exported specifically so backtest_strong_weak.js can reuse the EXACT
   // same pure math/classification functions the live app uses — a backtest
