@@ -372,6 +372,33 @@ function checkAndRecordRoundNumberSnapshot(){
 }
 
 const SCREENER_SCAN_TIME_MINUTES = 9 * 60 + 21;
+const BTST_LOCK_TIME_MINUTES = 15 * 60 + 10; // 3:10 PM — matches the backtest's own entry time exactly
+const BTST_VOLUME_RATIO_THRESHOLD = 1.5; // matches the backtest's default; delivery% is checked client-side, not here
+
+let btstLockedRows = null;
+let btstLockDone = false;
+let btstLockDateKey = null;
+let btstLockTimestamp = null;
+
+function checkAndRunBtstLock(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(btstLockDateKey !== dateKey){
+    btstLockDateKey = dateKey;
+    btstLockDone = false;
+    btstLockedRows = null;
+    btstLockTimestamp = null;
+  }
+
+  if(!btstLockDone && minutes >= BTST_LOCK_TIME_MINUTES){
+    const payload = trendScannerAvailable ? trendScanner.getBtstVolumeRatioPayload(state) : { rows: [] };
+    btstLockedRows = payload.rows.filter(r => r.volumeRatio > BTST_VOLUME_RATIO_THRESHOLD);
+    btstLockDone = true;
+    btstLockTimestamp = timeLabel();
+    console.log(`BTST volume-ratio list locked at ${btstLockTimestamp} — ${btstLockedRows.length} symbol(s) above ${BTST_VOLUME_RATIO_THRESHOLD}x (delivery% filter applied client-side, not reflected in this count).`);
+    saveBtstLock();
+  }
+}
 
 let screenerScanResults = { openlow: null, openhigh: null, gapneutral: null, openhighsimple: null, openlowyestlow: null, openlowsimple: null };
 let screenerScanDone = false;
@@ -1270,6 +1297,40 @@ function savePersistedHistory(){
 loadPersistedHistory();
 
 const SCREENER_SCAN_PERSIST_FILE = path.join(PERSIST_DIR, 'screener_scan.json');
+const BTST_LOCK_PERSIST_FILE = path.join(PERSIST_DIR, 'btst_lock.json');
+
+function loadBtstLock(){
+  try{
+    if(!fs.existsSync(BTST_LOCK_PERSIST_FILE)) {
+      console.log('No persisted BTST lock found — will lock fresh today at 3:10 PM.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(BTST_LOCK_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted BTST lock is from a previous day — will lock fresh today.');
+      return;
+    }
+    btstLockedRows = saved.btstLockedRows;
+    btstLockDone = saved.btstLockDone;
+    btstLockDateKey = saved.date;
+    btstLockTimestamp = saved.btstLockTimestamp;
+    console.log(`Restored today's BTST lock from disk (locked at ${btstLockTimestamp}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted BTST lock (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveBtstLock(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), btstLockedRows, btstLockDone, btstLockTimestamp };
+    fs.writeFileSync(BTST_LOCK_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save BTST lock to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadBtstLock();
 
 // first5MinLocked previously had NO disk persistence at all — a same-day
 // restart after 9:20 AM (e.g. a code redeploy in the afternoon) silently
@@ -1708,6 +1769,7 @@ let lastKnownDateKey = null;
 function recordMinuteSlot(){
   checkAndLockOpeningRanges();
   checkAndRunScreenerScan();
+  checkAndRunBtstLock();
   checkAndLockFirst5MinCandle();
   checkAndLockFirst15MinCandle();
   checkAndRunScreenerScan15m();
@@ -2297,6 +2359,10 @@ function buildPayload(){
     ? trendScanner.getMomentumScannerPayload(state, momentumScannerSymbols)
     : { matches: [] };
 
+  const btstLivePayload = trendScannerAvailable
+    ? trendScanner.getBtstVolumeRatioPayload(state)
+    : { rows: [] };
+
   return {
     ...computeScreeners(),
     slotHistory,
@@ -2326,6 +2392,14 @@ function buildPayload(){
     trendScanner: trendScannerAvailable ? trendScanner.getScannerPayload(state) : [],
     strongWeakScanner: strongWeakPayload,
     momentumScanner: momentumScannerPayload,
+    btstScanner: {
+      live: btstLivePayload.rows,
+      locked: btstLockedRows,
+      lockDone: btstLockDone,
+      lockTimestamp: btstLockTimestamp,
+      lockTimeTarget: BTST_LOCK_TIME_MINUTES,
+      volumeRatioThreshold: BTST_VOLUME_RATIO_THRESHOLD,
+    },
     // Full quote list for every tracked symbol (not just screener matches) —
     // needed by tools like the Gann Square of 9 calculator, which computes
     // levels for any symbol regardless of whether it matched any screener.
