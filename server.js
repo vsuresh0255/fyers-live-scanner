@@ -400,6 +400,71 @@ function checkAndRunBtstLock(){
   }
 }
 
+// Narrow CPR (Next-Day) — locks at market close (3:30 PM), since only then
+// is today's H/L/C truly final, making "tomorrow's projected CPR" an
+// actual, definitive projection rather than a still-forming one. Matches
+// the exact formula validated in backtest_narrow_cpr.js.
+const NARROW_CPR_LOCK_TIME_MINUTES = 15 * 60 + 30; // 3:30 PM, market close
+
+let narrowCprLockedRows = null;
+let narrowCprLockDone = false;
+let narrowCprLockDateKey = null;
+let narrowCprLockTimestamp = null;
+
+function checkAndRunNarrowCprLock(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(narrowCprLockDateKey !== dateKey){
+    narrowCprLockDateKey = dateKey;
+    narrowCprLockDone = false;
+    narrowCprLockedRows = null;
+    narrowCprLockTimestamp = null;
+  }
+
+  if(!narrowCprLockDone && minutes >= NARROW_CPR_LOCK_TIME_MINUTES){
+    const payload = trendScannerAvailable ? trendScanner.getNarrowCprPayload(state) : { rows: [] };
+    narrowCprLockedRows = payload.rows;
+    narrowCprLockDone = true;
+    narrowCprLockTimestamp = timeLabel();
+    console.log(`Narrow CPR (next-day) list locked at ${narrowCprLockTimestamp} — ${narrowCprLockedRows.length} symbol(s) qualify for tomorrow.`);
+    saveNarrowCprLock();
+  }
+}
+
+// Narrow Camarilla — same 3:30 PM lock convention as Narrow CPR, for the
+// same reason: today's H/L/C is only truly final at market close. Matches
+// the exact formula validated in backtest_narrow_camarilla.js, the most
+// trustworthy of the "narrow range" backtests (smallest ambiguous-day
+// rate, ~8% vs ~52% for the CPR versions). Recommended trade, per that
+// backtest: 1% target / 0.5% stop, entry at whichever of R3/S3 breaks first.
+const NARROW_CAMARILLA_LOCK_TIME_MINUTES = 15 * 60 + 30; // 3:30 PM, market close
+
+let narrowCamarillaLockedRows = null;
+let narrowCamarillaLockDone = false;
+let narrowCamarillaLockDateKey = null;
+let narrowCamarillaLockTimestamp = null;
+
+function checkAndRunNarrowCamarillaLock(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(narrowCamarillaLockDateKey !== dateKey){
+    narrowCamarillaLockDateKey = dateKey;
+    narrowCamarillaLockDone = false;
+    narrowCamarillaLockedRows = null;
+    narrowCamarillaLockTimestamp = null;
+  }
+
+  if(!narrowCamarillaLockDone && minutes >= NARROW_CAMARILLA_LOCK_TIME_MINUTES){
+    const payload = trendScannerAvailable ? trendScanner.getNarrowCamarillaPayload(state) : { rows: [] };
+    narrowCamarillaLockedRows = payload.rows;
+    narrowCamarillaLockDone = true;
+    narrowCamarillaLockTimestamp = timeLabel();
+    console.log(`Narrow Camarilla list locked at ${narrowCamarillaLockTimestamp} — ${narrowCamarillaLockedRows.length} symbol(s) qualify for tomorrow.`);
+    saveNarrowCamarillaLock();
+  }
+}
+
+
 let screenerScanResults = { openlow: null, openhigh: null, gapneutral: null, openhighsimple: null, openlowyestlow: null, openlowsimple: null };
 let screenerScanDone = false;
 let screenerScanDateKey = null;
@@ -1332,6 +1397,76 @@ function saveBtstLock(){
 
 loadBtstLock();
 
+const NARROW_CPR_LOCK_PERSIST_FILE = path.join(PERSIST_DIR, 'narrow_cpr_lock.json');
+
+function loadNarrowCprLock(){
+  try{
+    if(!fs.existsSync(NARROW_CPR_LOCK_PERSIST_FILE)) {
+      console.log('No persisted Narrow CPR lock found — will lock fresh today at 3:30 PM.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(NARROW_CPR_LOCK_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted Narrow CPR lock is from a previous day — will lock fresh today.');
+      return;
+    }
+    narrowCprLockedRows = saved.narrowCprLockedRows;
+    narrowCprLockDone = saved.narrowCprLockDone;
+    narrowCprLockDateKey = saved.date;
+    narrowCprLockTimestamp = saved.narrowCprLockTimestamp;
+    console.log(`Restored today's Narrow CPR lock from disk (locked at ${narrowCprLockTimestamp}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted Narrow CPR lock (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveNarrowCprLock(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), narrowCprLockedRows, narrowCprLockDone, narrowCprLockTimestamp };
+    fs.writeFileSync(NARROW_CPR_LOCK_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save Narrow CPR lock to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadNarrowCprLock();
+
+const NARROW_CAMARILLA_LOCK_PERSIST_FILE = path.join(PERSIST_DIR, 'narrow_camarilla_lock.json');
+
+function loadNarrowCamarillaLock(){
+  try{
+    if(!fs.existsSync(NARROW_CAMARILLA_LOCK_PERSIST_FILE)) {
+      console.log('No persisted Narrow Camarilla lock found — will lock fresh today at 3:30 PM.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(NARROW_CAMARILLA_LOCK_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted Narrow Camarilla lock is from a previous day — will lock fresh today.');
+      return;
+    }
+    narrowCamarillaLockedRows = saved.narrowCamarillaLockedRows;
+    narrowCamarillaLockDone = saved.narrowCamarillaLockDone;
+    narrowCamarillaLockDateKey = saved.date;
+    narrowCamarillaLockTimestamp = saved.narrowCamarillaLockTimestamp;
+    console.log(`Restored today's Narrow Camarilla lock from disk (locked at ${narrowCamarillaLockTimestamp}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted Narrow Camarilla lock (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveNarrowCamarillaLock(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), narrowCamarillaLockedRows, narrowCamarillaLockDone, narrowCamarillaLockTimestamp };
+    fs.writeFileSync(NARROW_CAMARILLA_LOCK_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save Narrow Camarilla lock to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadNarrowCamarillaLock();
+
 // first5MinLocked previously had NO disk persistence at all — a same-day
 // restart after 9:20 AM (e.g. a code redeploy in the afternoon) silently
 // wiped today's already-locked first-5-min candle for every symbol, with
@@ -1770,6 +1905,8 @@ function recordMinuteSlot(){
   checkAndLockOpeningRanges();
   checkAndRunScreenerScan();
   checkAndRunBtstLock();
+  checkAndRunNarrowCprLock();
+  checkAndRunNarrowCamarillaLock();
   checkAndLockFirst5MinCandle();
   checkAndLockFirst15MinCandle();
   checkAndRunScreenerScan15m();
@@ -2363,6 +2500,14 @@ function buildPayload(){
     ? trendScanner.getBtstVolumeRatioPayload(state)
     : { rows: [] };
 
+  const narrowCprLivePayload = trendScannerAvailable
+    ? trendScanner.getNarrowCprPayload(state)
+    : { rows: [] };
+
+  const narrowCamarillaLivePayload = trendScannerAvailable
+    ? trendScanner.getNarrowCamarillaPayload(state)
+    : { rows: [] };
+
   return {
     ...computeScreeners(),
     slotHistory,
@@ -2399,6 +2544,26 @@ function buildPayload(){
       lockTimestamp: btstLockTimestamp,
       lockTimeTarget: BTST_LOCK_TIME_MINUTES,
       volumeRatioThreshold: BTST_VOLUME_RATIO_THRESHOLD,
+    },
+    // Named narrowCprNextDay (NOT narrowCpr) deliberately - there's already
+    // an existing, different "Narrow CPR" screener above (narrowCpr /
+    // narrowCprScanDone / narrowCprScanTimestamp) from earlier in this
+    // project. This is a separate feature: the Chartink-formula-matched
+    // "today's CPR width > 10x tomorrow's projected width" backtest built
+    // and validated today - genuinely different logic, needs its own name.
+    narrowCprNextDay: {
+      live: narrowCprLivePayload.rows,
+      locked: narrowCprLockedRows,
+      lockDone: narrowCprLockDone,
+      lockTimestamp: narrowCprLockTimestamp,
+      lockTimeTarget: NARROW_CPR_LOCK_TIME_MINUTES,
+    },
+    narrowCamarilla: {
+      live: narrowCamarillaLivePayload.rows,
+      locked: narrowCamarillaLockedRows,
+      lockDone: narrowCamarillaLockDone,
+      lockTimestamp: narrowCamarillaLockTimestamp,
+      lockTimeTarget: NARROW_CAMARILLA_LOCK_TIME_MINUTES,
     },
     // Full quote list for every tracked symbol (not just screener matches) —
     // needed by tools like the Gann Square of 9 calculator, which computes
