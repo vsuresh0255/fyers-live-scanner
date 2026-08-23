@@ -1071,6 +1071,115 @@ function getBtstVolumeRatioPayload(stateRef){
   return { rows };
 }
 
+// ============================================================
+// Narrow CPR (Next-Day) — matches the exact formula validated in
+// backtest_narrow_cpr.js: today's CPR width > 10x tomorrow's PROJECTED
+// CPR width (computed from today's still-forming H/L/C), price 500-10000.
+// "Tomorrow's projected CPR" genuinely changes throughout the day as
+// today's H/L/C evolves - this is intentional, matching how the backtest
+// itself defines the signal, and only becomes FINAL once today's candle
+// closes at 3:30 PM (see server.js's checkAndRunNarrowCprLock).
+// ============================================================
+const NARROW_CPR_PRICE_MIN = 500, NARROW_CPR_PRICE_MAX = 10000;
+const NARROW_CPR_WIDTH_RATIO_THRESHOLD = 10;
+
+function computeCPR(dayCandle){
+  const pivot = (dayCandle.high + dayCandle.low + dayCandle.close) / 3;
+  const bc = (dayCandle.high + dayCandle.low) / 2;
+  const tc = 2*pivot - bc;
+  const width = Math.abs(tc - bc);
+  return { pivot, bc, tc, width };
+}
+
+function buildOneNarrowCprRow(symbol, s){
+  if(s.ltp == null || s.high == null || s.low == null || s.open == null) return null;
+  if(s.ltp <= NARROW_CPR_PRICE_MIN || s.ltp >= NARROW_CPR_PRICE_MAX) return null;
+
+  const dailyArr = candles['D'][symbol] || [];
+  if(dailyArr.length < 1) return null; // need at least 1 completed daily candle - only "yesterday" is ever read below
+
+  const yesterday = dailyArr[dailyArr.length - 1]; // most recent COMPLETED daily candle
+  const todayCPR = computeCPR(yesterday); // "today's" own CPR, from yesterday's H/L/C
+
+  // "tomorrow's" PROJECTED CPR, from TODAY's still-forming H/L/C (updates live all day)
+  const todaySoFar = { high: s.high, low: s.low, close: s.ltp };
+  const tomorrowCPR = computeCPR(todaySoFar);
+
+  if(todayCPR.width <= tomorrowCPR.width * NARROW_CPR_WIDTH_RATIO_THRESHOLD) return null;
+
+  return {
+    symbol, ltp: s.ltp,
+    todayWidth: todayCPR.width,
+    tomorrowTC: tomorrowCPR.tc, tomorrowBC: tomorrowCPR.bc, tomorrowPivot: tomorrowCPR.pivot,
+    tomorrowWidthPct: (tomorrowCPR.tc - tomorrowCPR.bc) / tomorrowCPR.pivot * 100,
+  };
+}
+
+function getNarrowCprPayload(stateRef){
+  const rows = [];
+  Object.keys(stateRef || {}).forEach(symbol => {
+    const row = buildOneNarrowCprRow(symbol, stateRef[symbol]);
+    if(row) rows.push(row);
+  });
+  return { rows };
+}
+
+// ============================================================
+// Narrow Camarilla — matches the exact formula validated in
+// backtest_narrow_camarilla.js: today's Camarilla range (R3/S3/R4/S4,
+// computed from today's still-forming H/L/C) must sit FULLY INSIDE
+// yesterday's (the most recent completed daily candle), on all four
+// levels at once. Backtest found this the most trustworthy of the three
+// "narrow range" approaches tested - only ~8% of days were genuinely
+// unresolvable intraday, vs ~52% for the CPR versions. Recommended trade:
+// 1% target / 0.5% stop, entry at whichever of R3/S3 breaks first.
+// ============================================================
+function computeCamarilla(h, l, c){
+  const rng = h - l;
+  return {
+    r4: c + rng*1.1/2,
+    r3: c + rng*1.1/4,
+    s3: c - rng*1.1/4,
+    s4: c - rng*1.1/2,
+  };
+}
+
+function buildOneNarrowCamarillaRow(symbol, s){
+  if(s.ltp == null || s.high == null || s.low == null) return null;
+
+  const dailyArr = candles['D'][symbol] || [];
+  if(dailyArr.length < 1) return null; // need at least 1 completed daily candle ("yesterday")
+
+  const yesterday = dailyArr[dailyArr.length - 1];
+  if(yesterday.high <= 0 || yesterday.low <= 0 || yesterday.close <= 0) return null;
+  const camYesterday = computeCamarilla(yesterday.high, yesterday.low, yesterday.close);
+
+  const todaySoFar = { high: s.high, low: s.low, close: s.ltp };
+  if(todaySoFar.high <= 0 || todaySoFar.low <= 0 || todaySoFar.close <= 0) return null;
+  const camToday = computeCamarilla(todaySoFar.high, todaySoFar.low, todaySoFar.close);
+
+  const cond1 = camToday.r3 < camYesterday.r3;
+  const cond2 = camToday.s3 > camYesterday.s3;
+  const cond3 = camToday.r4 < camYesterday.r4;
+  const cond4 = camToday.s4 > camYesterday.s4;
+  if(!(cond1 && cond2 && cond3 && cond4)) return null;
+
+  const todayInnerRange = camToday.r3 - camToday.s3;
+  const yesterdayInnerRange = camYesterday.r3 - camYesterday.s3;
+  const shrinkPct = yesterdayInnerRange > 0 ? (yesterdayInnerRange - todayInnerRange) / yesterdayInnerRange * 100 : 0;
+
+  return { symbol, ltp: s.ltp, r3: camToday.r3, s3: camToday.s3, r4: camToday.r4, s4: camToday.s4, shrinkPct };
+}
+
+function getNarrowCamarillaPayload(stateRef){
+  const rows = [];
+  Object.keys(stateRef || {}).forEach(symbol => {
+    const row = buildOneNarrowCamarillaRow(symbol, stateRef[symbol]);
+    if(row) rows.push(row);
+  });
+  return { rows };
+}
+
 module.exports = {
   processTick,
   backfillHistory,
@@ -1078,6 +1187,8 @@ module.exports = {
   getStrongWeakPayload,
   getMomentumScannerPayload,
   getBtstVolumeRatioPayload,
+  getNarrowCprPayload,
+  getNarrowCamarillaPayload,
   drainPendingNotifications,
   // Exported specifically so backtest_strong_weak.js can reuse the EXACT
   // same pure math/classification functions the live app uses — a backtest
