@@ -741,6 +741,17 @@ let weakNotifyCountToday = 0;
 let pendingNotifications = []; // messages queued for server.js to actually send via Telegram
 let strongWeakAlertLog = []; // { time, symbol, statusEvent: 'Strong'|'Weak', ltp, volumeChangePct, volumeRatio, ema21Pct, vwapPct, rsi, pivots, dayLow, dayHigh } — one entry per symbol per status per day, same trigger point as Telegram, for the on-page Alert Log table
 
+// Big-jump alert: fires when Vol Change % or Volume Ratio moves by more
+// than these amounts from one reading to the next, for the SAME symbol -
+// an early-warning signal for a sudden shift in trading activity, before
+// (not after) a big price move. Two independently-tunable thresholds since
+// the two metrics live on very different scales. Adjust these numbers
+// directly based on what you observe in practice - there's no backtest
+// behind these starting values, they're reasonable defaults to tune from.
+const VOL_CHANGE_JUMP_THRESHOLD_PCT = 50;   // Vol Change % moving by more than 50 percentage points
+const VOL_RATIO_JUMP_THRESHOLD = 1.0;       // Volume Ratio moving by more than 1.0x
+let previousVolMetrics = {}; // { [symbol]: { volumeChangePct, volumeRatio } } - last reading seen, for detecting a jump
+
 function resetStrongWeakIfNewDay(){
   const { dateKey } = getISTDateKeyAndMinutes();
   if(strongWeakDateKey !== dateKey){
@@ -755,6 +766,7 @@ function resetStrongWeakIfNewDay(){
     weakNotifyCountToday = 0;
     pendingNotifications = [];
     strongWeakAlertLog = [];
+    previousVolMetrics = {};
   }
 }
 
@@ -852,6 +864,31 @@ function buildOneStrongWeakRow(symbol, s, minutes, inNoteWindow){
   if(s.volume != null && yestVolume){
     volumeChangePct = (s.volume - yestVolume) / yestVolume * 100;
   }
+
+  // Big-jump alert: compare this reading to the last one seen for this
+  // symbol today. Fires independently for each metric (a big Vol Change %
+  // move and a big Volume Ratio move are different signals, worth
+  // separate alerts). Always updates previousVolMetrics after checking,
+  // whether or not a jump fired - so a value that jumps once and then
+  // stays elevated doesn't keep re-alerting every tick.
+  const prevVol = previousVolMetrics[symbol];
+  if(prevVol){
+    if(volumeChangePct != null && prevVol.volumeChangePct != null){
+      const delta = volumeChangePct - prevVol.volumeChangePct;
+      if(Math.abs(delta) >= VOL_CHANGE_JUMP_THRESHOLD_PCT){
+        const arrow = delta > 0 ? '📈' : '📉';
+        pendingNotifications.push(`${arrow} BIG VOL CHANGE JUMP: ${symbol} — Vol Chg% moved ${delta > 0 ? '+' : ''}${delta.toFixed(1)} points (${prevVol.volumeChangePct.toFixed(1)}% → ${volumeChangePct.toFixed(1)}%) at LTP ${ltp} — ${timeLabel()}`);
+      }
+    }
+    if(volumeRatio != null && prevVol.volumeRatio != null){
+      const delta = volumeRatio - prevVol.volumeRatio;
+      if(Math.abs(delta) >= VOL_RATIO_JUMP_THRESHOLD){
+        const arrow = delta > 0 ? '📈' : '📉';
+        pendingNotifications.push(`${arrow} BIG VOLUME RATIO JUMP: ${symbol} — Vol Ratio moved ${delta > 0 ? '+' : ''}${delta.toFixed(2)}x (${prevVol.volumeRatio.toFixed(2)}x → ${volumeRatio.toFixed(2)}x) at LTP ${ltp} — ${timeLabel()}`);
+      }
+    }
+  }
+  previousVolMetrics[symbol] = { volumeChangePct, volumeRatio };
 
   const pivots = yest ? computeClassicPivots(yest.high, yest.low, yest.close) : null;
   const pivotDesc = pivots ? describePivotPosition(ltp, pivots) : '—';
