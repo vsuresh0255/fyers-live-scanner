@@ -711,7 +711,9 @@ function buildLockedScreener15mRows(key){
 }
 
 const FIRST_5MIN_LOCK_MINUTES = 9 * 60 + 20;
+const FIRST_5MIN_LOCK_HARD_CUTOFF_MINUTES = 9 * 60 + 25; // 5-min grace window, same pattern as the pre-market-close fix
 const FIRST_15MIN_LOCK_MINUTES = 9 * 60 + 30; // 9:30 AM — end of the 9:15-9:30 window
+const FIRST_15MIN_LOCK_HARD_CUTOFF_MINUTES = 9 * 60 + 35; // 5-min grace window, same pattern as the pre-market-close fix
 
 // Top-3-Losers-at-9:16, Loser #2 short — locks ONCE per day, right at 9:16
 // AM, matching the exact signal timing validated in backtest_top_losers_916.js
@@ -964,6 +966,11 @@ let earlyExhaustionScanDone = false;
 let earlyExhaustionScanTimestamp = null;
 let earlyExhaustionDateKey = null;
 
+// 2026-08-24 fix: same class of bug as checkAndLockPreMarketClose - this
+// used to lock permanently the instant minutes passed FIRST_5MIN_LOCK_MINUTES,
+// even if the Fyers connection hadn't had a chance to establish yet after a
+// restart. Now waits for at least one symbol to have real data, or gives up
+// gracefully at a hard cutoff a few minutes later.
 function checkAndLockFirst5MinCandle(){
   const { dateKey, minutes } = getISTDateKeyAndMinutes();
   if(first5MinDateKey !== dateKey){
@@ -971,21 +978,36 @@ function checkAndLockFirst5MinCandle(){
     first5MinLockedFlag = false;
     first5MinLocked = {};
   }
-  if(!first5MinLockedFlag && minutes >= FIRST_5MIN_LOCK_MINUTES){
-    Object.keys(state).forEach(symbol => {
-      const s = state[symbol];
-      if(s.high !== null && s.low !== null && s.ltp !== null && s.open !== null) first5MinLocked[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
-    });
+  if(first5MinLockedFlag || minutes < FIRST_5MIN_LOCK_MINUTES) return;
+
+  const captured = {};
+  Object.keys(state).forEach(symbol => {
+    const s = state[symbol];
+    if(s.high !== null && s.low !== null && s.ltp !== null && s.open !== null) captured[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
+  });
+  const gotAnyData = Object.keys(captured).length > 0;
+  const pastHardCutoff = minutes >= FIRST_5MIN_LOCK_HARD_CUTOFF_MINUTES;
+
+  if(gotAnyData || pastHardCutoff){
+    first5MinLocked = captured;
     first5MinLockedFlag = true;
-    console.log(`First-5-min candle locked for ${Object.keys(first5MinLocked).length} symbols.`);
+    if(gotAnyData){
+      console.log(`First-5-min candle locked for ${Object.keys(first5MinLocked).length} symbols.`);
+    } else {
+      console.log(`First-5-min candle: no symbol had live data by the hard cutoff — giving up for today (likely a restart well after market open).`);
+    }
     saveFirst5MinLocked();
   }
+  // else: keep retrying next cycle - the connection may still be establishing
 }
 
 // Same exact pattern as checkAndLockFirst5MinCandle — state[symbol].high/low
 // are cumulative from market open (9:15) already, so locking at 9:30 instead
 // of 9:20 naturally captures the true 9:15-9:30 range, no separate candle
 // tracking needed.
+// Same fix as checkAndLockFirst5MinCandle above (2026-08-24) - waits for
+// real data or a hard cutoff, instead of locking permanently and instantly
+// with nothing on a late restart.
 function checkAndLockFirst15MinCandle(){
   const { dateKey, minutes } = getISTDateKeyAndMinutes();
   if(first15MinDateKey !== dateKey){
@@ -993,14 +1015,26 @@ function checkAndLockFirst15MinCandle(){
     first15MinLockedFlag = false;
     first15MinLocked = {};
   }
-  if(!first15MinLockedFlag && minutes >= FIRST_15MIN_LOCK_MINUTES){
-    Object.keys(state).forEach(symbol => {
-      const s = state[symbol];
-      if(s.high !== null && s.low !== null && s.ltp !== null && s.open !== null) first15MinLocked[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
-    });
+  if(first15MinLockedFlag || minutes < FIRST_15MIN_LOCK_MINUTES) return;
+
+  const captured = {};
+  Object.keys(state).forEach(symbol => {
+    const s = state[symbol];
+    if(s.high !== null && s.low !== null && s.ltp !== null && s.open !== null) captured[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
+  });
+  const gotAnyData = Object.keys(captured).length > 0;
+  const pastHardCutoff = minutes >= FIRST_15MIN_LOCK_HARD_CUTOFF_MINUTES;
+
+  if(gotAnyData || pastHardCutoff){
+    first15MinLocked = captured;
     first15MinLockedFlag = true;
-    console.log(`First-15-min candle locked for ${Object.keys(first15MinLocked).length} symbols.`);
+    if(gotAnyData){
+      console.log(`First-15-min candle locked for ${Object.keys(first15MinLocked).length} symbols.`);
+    } else {
+      console.log(`First-15-min candle: no symbol had live data by the hard cutoff — giving up for today (likely a restart well after market open).`);
+    }
   }
+  // else: keep retrying next cycle - the connection may still be establishing
 }
 
 function checkAndSaveEODSnapshot(){
