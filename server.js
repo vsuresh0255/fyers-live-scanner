@@ -746,6 +746,17 @@ let preMarketClose = {};
 let preMarketCloseLockedFlag = false;
 let preMarketCloseDateKey = null;
 
+// 2026-08-24 fix: this used to lock permanently the INSTANT minutes first
+// passed PRE_MARKET_CLOSE_MINUTES, with no regard for whether the Fyers
+// connection had actually had a chance to establish yet. On any restart
+// happening shortly after 9:09 AM (a redeploy, a crash), this fired
+// immediately with 0 symbols captured, and - being a one-shot lock - never
+// retried for the rest of the day. Now: keeps retrying every cycle until
+// EITHER at least one symbol has real data, OR a hard cutoff (market open,
+// 9:15 AM) passes - past which "pre-market close" is genuinely
+// unrecoverable anyway, so there's no point waiting further.
+const PRE_MARKET_CLOSE_HARD_CUTOFF_MINUTES = 9 * 60 + 15;
+
 function checkAndLockPreMarketClose(){
   const { dateKey, minutes } = getISTDateKeyAndMinutes();
   if(preMarketCloseDateKey !== dateKey){
@@ -753,14 +764,26 @@ function checkAndLockPreMarketClose(){
     preMarketCloseLockedFlag = false;
     preMarketClose = {};
   }
-  if(!preMarketCloseLockedFlag && minutes >= PRE_MARKET_CLOSE_MINUTES){
-    HALF_DAY_SYMBOLS.forEach(symbol => {
-      const s = state[symbol];
-      if(s && s.ltp !== null) preMarketClose[symbol] = s.ltp;
-    });
+  if(preMarketCloseLockedFlag || minutes < PRE_MARKET_CLOSE_MINUTES) return;
+
+  const captured = {};
+  HALF_DAY_SYMBOLS.forEach(symbol => {
+    const s = state[symbol];
+    if(s && s.ltp !== null) captured[symbol] = s.ltp;
+  });
+  const gotAnyData = Object.keys(captured).length > 0;
+  const pastHardCutoff = minutes >= PRE_MARKET_CLOSE_HARD_CUTOFF_MINUTES;
+
+  if(gotAnyData || pastHardCutoff){
+    preMarketClose = captured;
     preMarketCloseLockedFlag = true;
-    console.log(`Pre-market close captured for ${Object.keys(preMarketClose).length} symbol(s).`);
+    if(gotAnyData){
+      console.log(`Pre-market close captured for ${Object.keys(preMarketClose).length} symbol(s).`);
+    } else {
+      console.log(`Pre-market close: no symbol had live data by ${PRE_MARKET_CLOSE_HARD_CUTOFF_MINUTES/60|0}:${String(PRE_MARKET_CLOSE_HARD_CUTOFF_MINUTES%60).padStart(2,'0')} — giving up for today (likely a restart well after market open; discovery will fall back to live LTP instead, same as it already does).`);
+    }
   }
+  // else: keep retrying next cycle - the connection may still be establishing
 }
 
 const EOD_SNAPSHOT_MINUTES = 15 * 60 + 30;
