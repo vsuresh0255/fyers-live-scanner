@@ -52,6 +52,8 @@ const http = require('http');
 const https = require('https');
 const url = require('url');
 const WebSocket = require('ws');
+const AdmZip = require('adm-zip');
+const Papa = require('papaparse');
 // Patches a real bug in fyers-api-v3's tbtsocket/tbtSocket.js: it calls https.get()
 // without importing 'https' first, causing "https is not defined" and silently falling
 // back to a generic hardcoded URL instead of fetching the real, account-specific socket
@@ -847,6 +849,129 @@ function fetchUrl(targetUrl, timeoutMs = 15000){
   });
 }
 
+// Same timeout-safety pattern as fetchUrl, but returns raw binary data
+// (a Buffer) instead of text - needed for downloading the bhavcopy zip file.
+function fetchUrlBinary(targetUrl, timeoutMs = 30000){
+  return new Promise((resolve, reject) => {
+    const req = https.get(targetUrl, (res) => {
+      if(res.statusCode !== 200){
+        res.resume(); // drain the response so the socket can be reused/closed cleanly
+        reject(new Error(`HTTP ${res.statusCode} fetching ${targetUrl}`));
+        return;
+      }
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      reject(new Error(`Request to ${targetUrl} timed out after ${timeoutMs}ms`));
+    });
+  });
+}
+
+// ============================================================
+// Automatic bhavcopy fetching — 2026-08-24
+// =====================================================================
+// Downloads NSE's daily F&O bhavcopy (the new UDiFF zip format, confirmed
+// via NSE's own circular no. 62424 - the old op*.csv/fo*.csv format was
+// discontinued July 8 2024), parses it with the EXACT SAME papaparse
+// config the Setup page's browser-side upload uses (same header transform,
+// same raw un-normalized row shape - normalization happens downstream in
+// each consuming page, unchanged), and broadcasts it to connected clients
+// so the Setup page can auto-save it into IndexedDB itself, exactly as if
+// it had been manually uploaded. No downstream screener page's own logic
+// changes - only how the data gets into IndexedDB in the first place.
+//
+// Also handles the daily "previous day" rollover automatically: before
+// fetching today's fresh data, whatever was fetched yesterday becomes the
+// new "prev" data - removing the need to separately upload a previous-day
+// file by hand.
+// ============================================================
+const BHAVCOPY_FETCH_START_MINUTES = 16 * 60 + 15; // 4:15 PM IST - bhavcopy is typically available ~30-60 min after 3:30 PM close
+const BHAVCOPY_FETCH_HARD_CUTOFF_MINUTES = 19 * 60; // 7:00 PM IST - give up for today past this, NSE publishing can run late
+const BHAVCOPY_RETRY_INTERVAL_MS = 5 * 60 * 1000; // retry every 5 minutes while NSE hasn't published yet
+
+let bhavcopyData = { nseRows: null, nseFutRows: null, nseRowsPrev: null, nseFutRowsPrev: null, fetchedAt: null, fetchDateKey: null };
+let bhavcopyFetchDoneToday = false;
+let bhavcopyFetchDateKey = null;
+let bhavcopyLastAttemptAt = 0;
+
+function buildNseFoBhavcopyUrl(dateObj){
+  const pad = n => String(n).padStart(2, '0');
+  const yyyy = dateObj.getFullYear();
+  const mm = pad(dateObj.getMonth() + 1);
+  const dd = pad(dateObj.getDate());
+  return `https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_${yyyy}${mm}${dd}_F_0000.csv.zip`;
+}
+
+async function fetchAndParseTodaysBhavcopy(){
+  const now = new Date();
+  const url = buildNseFoBhavcopyUrl(now);
+  const zipBuffer = await fetchUrlBinary(url);
+
+  const zip = new AdmZip(zipBuffer);
+  const entries = zip.getEntries();
+  const names = entries.map(e => e.entryName);
+  const udiffFile = names.find(n => /^bhavcopy_nse_fo.*\.csv$/i.test(n.split('/').pop()));
+  if(!udiffFile){
+    throw new Error(`Downloaded zip did not contain a recognizable UDiFF CSV file (found: ${names.join(', ') || 'nothing'})`);
+  }
+
+  const entry = entries.find(e => e.entryName === udiffFile);
+  const csvText = entry.getData().toString('utf8');
+
+  // exact same parse config as the Setup page's browser-side upload
+  const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true, transformHeader: h => h.replace(/^\uFEFF/, '').trim() });
+  if(!parsed.data || parsed.data.length === 0){
+    throw new Error('Parsed bhavcopy CSV has zero rows - something is wrong with the downloaded file');
+  }
+  return parsed.data; // raw rows, matching nseRows/nseFutRows shape exactly (new UDiFF format combines both)
+}
+
+async function checkAndFetchBhavcopy(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(bhavcopyFetchDateKey !== dateKey){
+    bhavcopyFetchDateKey = dateKey;
+    bhavcopyFetchDoneToday = false;
+  }
+
+  if(bhavcopyFetchDoneToday || minutes < BHAVCOPY_FETCH_START_MINUTES) return;
+
+  const nowMs = Date.now();
+  if(nowMs - bhavcopyLastAttemptAt < BHAVCOPY_RETRY_INTERVAL_MS) return; // don't hammer NSE every tick cycle - only retry every few minutes
+  bhavcopyLastAttemptAt = nowMs;
+
+  try{
+    const rows = await fetchAndParseTodaysBhavcopy();
+
+    // roll yesterday's already-fetched data into "prev" BEFORE overwriting
+    // with today's - this is what eliminates the old manual previous-day upload step
+    const prevRows = bhavcopyData.nseRows;
+
+    bhavcopyData = {
+      nseRows: rows,
+      nseFutRows: rows, // new UDiFF format combines options+futures in one file, same as the browser upload does
+      nseRowsPrev: prevRows,
+      nseFutRowsPrev: prevRows,
+      fetchedAt: new Date().toISOString(),
+      fetchDateKey: dateKey,
+    };
+    bhavcopyFetchDoneToday = true;
+    console.log(`Bhavcopy auto-fetched successfully: ${rows.length} rows for ${dateKey}.${prevRows ? ` Previous day rolled forward (${prevRows.length} rows).` : ' No previous day data available yet (first run).'}`);
+    saveBhavcopyData();
+  } catch(err){
+    if(minutes >= BHAVCOPY_FETCH_HARD_CUTOFF_MINUTES){
+      bhavcopyFetchDoneToday = true; // give up for today - stop retrying, NSE likely isn't publishing today (holiday, etc.)
+      console.log(`Bhavcopy auto-fetch: giving up for today after repeated failures past the hard cutoff. Last error: ${err.message}`);
+    } else {
+      console.log(`Bhavcopy auto-fetch attempt failed (will retry in ${BHAVCOPY_RETRY_INTERVAL_MS/60000} min): ${err.message}`);
+    }
+  }
+}
+
 function parseStrikesFromCsv(csvText, indexSymbol, atmStrike, interval){
   if(!csvText) return {};
   const nowTs = Date.now() / 1000;
@@ -1613,6 +1738,36 @@ function saveTop3Losers916Lock(){
 
 loadTop3Losers916Lock();
 
+const BHAVCOPY_PERSIST_FILE = path.join(PERSIST_DIR, 'bhavcopy_data.json');
+
+function loadBhavcopyData(){
+  try{
+    if(!fs.existsSync(BHAVCOPY_PERSIST_FILE)) {
+      console.log('No persisted bhavcopy data found — will auto-fetch fresh starting at 4:15 PM today.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(BHAVCOPY_PERSIST_FILE, 'utf8'));
+    bhavcopyData = saved.bhavcopyData || bhavcopyData;
+    bhavcopyFetchDoneToday = saved.fetchDateKey === todayDateKey();
+    bhavcopyFetchDateKey = saved.fetchDateKey || null;
+    console.log(`Restored bhavcopy data from disk (last fetched: ${bhavcopyData.fetchedAt || 'never'}, for ${bhavcopyData.fetchDateKey || 'n/a'}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted bhavcopy data (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveBhavcopyData(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { bhavcopyData, fetchDateKey: bhavcopyFetchDateKey };
+    fs.writeFileSync(BHAVCOPY_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save bhavcopy data to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadBhavcopyData();
+
 // first5MinLocked previously had NO disk persistence at all — a same-day
 // restart after 9:20 AM (e.g. a code redeploy in the afternoon) silently
 // wiped today's already-locked first-5-min candle for every symbol, with
@@ -2054,6 +2209,7 @@ function recordMinuteSlot(){
   checkAndRunNarrowCprLock();
   checkAndRunNarrowCamarillaLock();
   checkAndLockTop3Losers916();
+  checkAndFetchBhavcopy();
   checkAndLockFirst5MinCandle();
   checkAndLockFirst15MinCandle();
   checkAndRunScreenerScan15m();
@@ -2595,6 +2751,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/bhavcopy-data' && req.method === 'GET') {
+    // Serves the full auto-fetched bhavcopy data on demand - deliberately
+    // NOT part of the regular live broadcast (which fires on every tick),
+    // since this can be tens of thousands of rows. The Setup page should
+    // watch bhavcopyMeta.fetchedAt in the regular broadcast, and only
+    // call this endpoint once when it notices that timestamp has changed.
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(bhavcopyData));
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -2741,6 +2908,18 @@ function buildPayload(){
       locked: top3Losers916Locked,
       lockDone: top3Losers916LockedFlag,
       lockTimeTarget: TOP3_LOSERS_916_LOCK_MINUTES,
+    },
+    // Only lightweight metadata goes in the regular broadcast (which fires
+    // on every tick) - the actual bhavcopy data can be tens of thousands
+    // of rows, and repeating that on every single tick to every connected
+    // client would be a serious bandwidth problem. Clients that see
+    // fetchedAt change should fetch the full data once via GET /bhavcopy-data
+    // instead, not expect it to arrive over the live socket.
+    bhavcopyMeta: {
+      fetchedAt: bhavcopyData.fetchedAt,
+      fetchDateKey: bhavcopyData.fetchDateKey,
+      rowCount: bhavcopyData.nseRows ? bhavcopyData.nseRows.length : 0,
+      prevRowCount: bhavcopyData.nseRowsPrev ? bhavcopyData.nseRowsPrev.length : 0,
     },
     // Full quote list for every tracked symbol (not just screener matches) —
     // needed by tools like the Gann Square of 9 calculator, which computes
