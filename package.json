@@ -5,10 +5,10 @@
   "scripts": {
     "start": "node server.js"
   },
-"dependencies": {
-  "ws": "...",
-  "fyers-api-v3": "...",
-  "adm-zip": "^0.5.16",
-  "papaparse": "^5.4.1"
-}
+  "dependencies": {
+    "ws": "*",
+    "fyers-api-v3": "*",
+    "adm-zip": "^0.6.0",
+    "papaparse": "^5.4.1"
+  }
 }
