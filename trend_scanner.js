@@ -1217,6 +1217,44 @@ function getNarrowCamarillaPayload(stateRef){
   return { rows };
 }
 
+// ============================================================
+// Top-3-Losers-at-9:16, Loser #2 short — matches the exact formula
+// validated in backtest_top_losers_916.js (71-day, +0.311% EV, the
+// second-strongest confirmed edge of the whole day's testing):
+//   - At 9:16 AM, rank every stock by (open - ltp)/open*100 (biggest
+//     drop-from-open first). The #2 biggest dropper is the actionable one.
+//   - Entry (short) = that stock's 9:16 price
+//   - Stop = today's open (the opposite side)
+//   - Target = entry - (open - entry), i.e. 1:1, extending further down
+//   - Exit at 9:30 AM if neither is hit (handled by whoever is watching
+//     live - this function only identifies the setup, it doesn't manage
+//     the trade's later 9:30 exit)
+// This is a ONE-TIME-PER-DAY ranking, unlike the other live scanners -
+// called once by server.js at/after 9:16 AM, not on every tick.
+// ============================================================
+function computeTop3LosersAt916(stateRef){
+  const drops = [];
+  Object.keys(stateRef || {}).forEach(symbol => {
+    const s = stateRef[symbol];
+    if(s.ltp == null || s.open == null || s.open <= 0) return;
+    const dropPct = (s.open - s.ltp) / s.open * 100;
+    drops.push({ symbol, open: s.open, price916: s.ltp, dropPct });
+  });
+  drops.sort((a, b) => b.dropPct - a.dropPct); // biggest drop first
+
+  const top3 = drops.slice(0, 3).map((d, i) => {
+    const rank = i + 1;
+    const riskDistance = d.open - d.price916; // always positive by construction
+    const target = d.price916 - riskDistance; // 1:1, extending further down (short)
+    return {
+      rank, symbol: d.symbol, dropPct: d.dropPct,
+      open: d.open, entryPrice: d.price916, stopPrice: d.open, targetPrice: target,
+      actionable: rank === 2, // Loser #2 specifically is the backtested, actionable one
+    };
+  });
+  return { rows: top3 };
+}
+
 module.exports = {
   processTick,
   backfillHistory,
@@ -1226,6 +1264,7 @@ module.exports = {
   getBtstVolumeRatioPayload,
   getNarrowCprPayload,
   getNarrowCamarillaPayload,
+  computeTop3LosersAt916,
   drainPendingNotifications,
   // Exported specifically so backtest_strong_weak.js can reuse the EXACT
   // same pure math/classification functions the live app uses — a backtest
