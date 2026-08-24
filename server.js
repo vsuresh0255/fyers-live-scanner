@@ -698,6 +698,35 @@ function buildLockedScreener15mRows(key){
 
 const FIRST_5MIN_LOCK_MINUTES = 9 * 60 + 20;
 const FIRST_15MIN_LOCK_MINUTES = 9 * 60 + 30; // 9:30 AM — end of the 9:15-9:30 window
+
+// Top-3-Losers-at-9:16, Loser #2 short — locks ONCE per day, right at 9:16
+// AM, matching the exact signal timing validated in backtest_top_losers_916.js
+// (71-day, +0.311% EV, the second-strongest confirmed edge of the whole
+// day's testing). Unlike the other live scanners, this is a one-shot daily
+// ranking, not something that keeps recalculating all day - the ranking is
+// only meaningful at that one specific moment.
+const TOP3_LOSERS_916_LOCK_MINUTES = 9 * 60 + 16;
+let top3Losers916Locked = null;
+let top3Losers916LockedFlag = false;
+let top3Losers916DateKey = null;
+
+function checkAndLockTop3Losers916(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+  if(top3Losers916DateKey !== dateKey){
+    top3Losers916DateKey = dateKey;
+    top3Losers916LockedFlag = false;
+    top3Losers916Locked = null;
+  }
+  if(!top3Losers916LockedFlag && minutes >= TOP3_LOSERS_916_LOCK_MINUTES){
+    const payload = trendScannerAvailable ? trendScanner.computeTop3LosersAt916(state) : { rows: [] };
+    top3Losers916Locked = payload.rows;
+    top3Losers916LockedFlag = true;
+    const loser2 = top3Losers916Locked.find(r => r.rank === 2);
+    console.log(`Top-3-Losers-at-9:16 locked — ${top3Losers916Locked.length} symbol(s) ranked.${loser2 ? ` Loser #2: ${loser2.symbol} (${loser2.dropPct.toFixed(2)}% drop, entry ${loser2.entryPrice.toFixed(2)}, stop ${loser2.stopPrice.toFixed(2)}, target ${loser2.targetPrice.toFixed(2)}).` : ''}`);
+    saveTop3Losers916Lock();
+  }
+}
+
 const PRE_MARKET_CLOSE_MINUTES = 9 * 60 + 9;
 let preMarketClose = {};
 let preMarketCloseLockedFlag = false;
@@ -1467,6 +1496,40 @@ function saveNarrowCamarillaLock(){
 
 loadNarrowCamarillaLock();
 
+const TOP3_LOSERS_916_PERSIST_FILE = path.join(PERSIST_DIR, 'top3_losers_916_lock.json');
+
+function loadTop3Losers916Lock(){
+  try{
+    if(!fs.existsSync(TOP3_LOSERS_916_PERSIST_FILE)) {
+      console.log('No persisted Top-3-Losers-at-9:16 lock found — will lock fresh today at 9:16 AM.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(TOP3_LOSERS_916_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted Top-3-Losers-at-9:16 lock is from a previous day — will lock fresh today.');
+      return;
+    }
+    top3Losers916Locked = saved.top3Losers916Locked;
+    top3Losers916LockedFlag = saved.top3Losers916LockedFlag;
+    top3Losers916DateKey = saved.date;
+    console.log(`Restored today's Top-3-Losers-at-9:16 lock from disk — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted Top-3-Losers-at-9:16 lock (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveTop3Losers916Lock(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), top3Losers916Locked, top3Losers916LockedFlag };
+    fs.writeFileSync(TOP3_LOSERS_916_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save Top-3-Losers-at-9:16 lock to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadTop3Losers916Lock();
+
 // first5MinLocked previously had NO disk persistence at all — a same-day
 // restart after 9:20 AM (e.g. a code redeploy in the afternoon) silently
 // wiped today's already-locked first-5-min candle for every symbol, with
@@ -1907,6 +1970,7 @@ function recordMinuteSlot(){
   checkAndRunBtstLock();
   checkAndRunNarrowCprLock();
   checkAndRunNarrowCamarillaLock();
+  checkAndLockTop3Losers916();
   checkAndLockFirst5MinCandle();
   checkAndLockFirst15MinCandle();
   checkAndRunScreenerScan15m();
@@ -2564,6 +2628,11 @@ function buildPayload(){
       lockDone: narrowCamarillaLockDone,
       lockTimestamp: narrowCamarillaLockTimestamp,
       lockTimeTarget: NARROW_CAMARILLA_LOCK_TIME_MINUTES,
+    },
+    top3Losers916: {
+      locked: top3Losers916Locked,
+      lockDone: top3Losers916LockedFlag,
+      lockTimeTarget: TOP3_LOSERS_916_LOCK_MINUTES,
     },
     // Full quote list for every tracked symbol (not just screener matches) —
     // needed by tools like the Gann Square of 9 calculator, which computes
