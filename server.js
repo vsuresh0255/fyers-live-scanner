@@ -791,6 +791,7 @@ function checkAndLockPreMarketClose(){
 }
 
 const EOD_SNAPSHOT_MINUTES = 15 * 60 + 30;
+const EOD_SNAPSHOT_HARD_CUTOFF_MINUTES = 15 * 60 + 35; // 5-min grace window, same pattern as the other lock fixes
 
 let first5MinLocked = {};
 let first5MinLockedFlag = false;
@@ -806,6 +807,7 @@ let eodSnapshotDateKey = null;
 
 const HALF_DAY_SYMBOLS = ['NIFTY', 'BANKNIFTY', 'SENSEX'];
 const FIRST_HALF_LOCK_MINUTES = 9 * 60 + 15 + 195;
+const FIRST_HALF_LOCK_HARD_CUTOFF_MINUTES = FIRST_HALF_LOCK_MINUTES + 5; // 5-min grace window, same pattern as the other lock fixes
 
 let firstHalfLocked = {};
 let secondHalfRunning = {};
@@ -851,9 +853,12 @@ function fetchUrl(targetUrl, timeoutMs = 15000){
 
 // Same timeout-safety pattern as fetchUrl, but returns raw binary data
 // (a Buffer) instead of text - needed for downloading the bhavcopy zip file.
-function fetchUrlBinary(targetUrl, timeoutMs = 30000){
+// Accepts optional custom headers, since NSE's archives server is known to
+// reject plain requests with no User-Agent / session cookie (returning a
+// 404 rather than a more honest 403 to obscure that the file exists).
+function fetchUrlBinary(targetUrl, headers = {}, timeoutMs = 30000){
   return new Promise((resolve, reject) => {
-    const req = https.get(targetUrl, (res) => {
+    const req = https.get(targetUrl, { headers }, (res) => {
       if(res.statusCode !== 200){
         res.resume(); // drain the response so the socket can be reused/closed cleanly
         reject(new Error(`HTTP ${res.statusCode} fetching ${targetUrl}`));
@@ -862,6 +867,24 @@ function fetchUrlBinary(targetUrl, timeoutMs = 30000){
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
       res.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      reject(new Error(`Request to ${targetUrl} timed out after ${timeoutMs}ms`));
+    });
+  });
+}
+
+// Some responses (like NSE's own homepage) need their Set-Cookie headers
+// read directly, since fetchUrlBinary only returns the body. This is the
+// same shape of request as fetchUrlBinary, just also resolving the headers.
+function fetchWithHeaders(targetUrl, headers = {}, timeoutMs = 15000){
+  return new Promise((resolve, reject) => {
+    const req = https.get(targetUrl, { headers }, (res) => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
     });
     req.on('error', reject);
     req.setTimeout(timeoutMs, () => {
@@ -888,10 +911,22 @@ function fetchUrlBinary(targetUrl, timeoutMs = 30000){
 // fetching today's fresh data, whatever was fetched yesterday becomes the
 // new "prev" data - removing the need to separately upload a previous-day
 // file by hand.
+//
+// 2026-08-24 update: NSE's archives server rejects plain requests with no
+// User-Agent / session cookie, returning a 404 instead of a more honest
+// 403 to obscure that the file exists - confirmed by a real incident
+// where the file was manually verified available while every automated
+// fetch attempt got a consistent 404 for 30+ minutes straight (not a
+// "not published yet" pattern, which would eventually succeed on retry).
+// Fixed by adding a realistic browser User-Agent and establishing a real
+// session cookie against NSE's main site first, matching the pattern used
+// by working NSE-scraping libraries (e.g. the "nse" Python package).
 // ============================================================
 const BHAVCOPY_FETCH_START_MINUTES = 16 * 60 + 15; // 4:15 PM IST - bhavcopy is typically available ~30-60 min after 3:30 PM close
 const BHAVCOPY_FETCH_HARD_CUTOFF_MINUTES = 19 * 60; // 7:00 PM IST - give up for today past this, NSE publishing can run late
 const BHAVCOPY_RETRY_INTERVAL_MS = 5 * 60 * 1000; // retry every 5 minutes while NSE hasn't published yet
+
+const NSE_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 let bhavcopyData = { nseRows: null, nseFutRows: null, nseRowsPrev: null, nseFutRowsPrev: null, fetchedAt: null, fetchDateKey: null };
 let bhavcopyFetchDoneToday = false;
@@ -906,10 +941,39 @@ function buildNseFoBhavcopyUrl(dateObj){
   return `https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_${yyyy}${mm}${dd}_F_0000.csv.zip`;
 }
 
+// Visits NSE's main site with a realistic browser User-Agent to obtain a
+// real session cookie, the same first step working NSE-scraping tools take
+// before the archives server will actually serve a file. Returns a cookie
+// header string built from whatever Set-Cookie headers came back, or an
+// empty string if none were set (some responses set none, which is fine -
+// the caller just proceeds without a cookie in that case).
+async function establishNseSession(){
+  const resp = await fetchWithHeaders('https://www.nseindia.com/', {
+    'User-Agent': NSE_USER_AGENT,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  });
+  const setCookieHeaders = resp.headers['set-cookie'] || [];
+  // each Set-Cookie entry looks like "name=value; Path=/; ..." - we only
+  // need the "name=value" part for the Cookie header on the next request
+  const cookiePairs = setCookieHeaders.map(c => c.split(';')[0]);
+  return cookiePairs.join('; ');
+}
+
 async function fetchAndParseTodaysBhavcopy(){
   const now = new Date();
   const url = buildNseFoBhavcopyUrl(now);
-  const zipBuffer = await fetchUrlBinary(url);
+
+  let cookie = '';
+  try{
+    cookie = await establishNseSession();
+  } catch(err){
+    console.log(`Bhavcopy: could not establish an NSE session cookie (continuing without one): ${err.message}`);
+  }
+
+  const headers = { 'User-Agent': NSE_USER_AGENT };
+  if(cookie) headers['Cookie'] = cookie;
+
+  const zipBuffer = await fetchUrlBinary(url, headers);
 
   const zip = new AdmZip(zipBuffer);
   const entries = zip.getEntries();
@@ -926,6 +990,7 @@ async function fetchAndParseTodaysBhavcopy(){
   const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true, transformHeader: h => h.replace(/^\uFEFF/, '').trim() });
   if(!parsed.data || parsed.data.length === 0){
     throw new Error('Parsed bhavcopy CSV has zero rows - something is wrong with the downloaded file');
+
   }
   return parsed.data; // raw rows, matching nseRows/nseFutRows shape exactly (new UDiFF format combines both)
 }
@@ -1211,18 +1276,39 @@ function checkAndLockFirstHalf(){
     secondHalfRunning = {};
     secondHalfOpen = {};
   }
+  // 2026-08-24 fix: same class of bug as the other lock functions - used to
+  // lock permanently and instantly with whatever (possibly nothing) was in
+  // state the moment 12:30 PM passed, even on a restart where the connection
+  // hadn't had a chance to establish yet. Now waits for at least one symbol
+  // to have real data, or gives up gracefully after a short grace window.
   if(!firstHalfLockedFlag && minutes >= FIRST_HALF_LOCK_MINUTES){
     const allSymbols = [...HALF_DAY_SYMBOLS, ...multiStrikeSymbolList];
+    const captured = {};
+    const capturedSecondHalfOpen = {};
+    const capturedSecondHalfRunning = {};
     allSymbols.forEach(symbol => {
       const s = state[symbol];
       if(s && s.open !== null && s.high !== null && s.low !== null && s.ltp !== null){
-        firstHalfLocked[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
-        secondHalfOpen[symbol] = s.ltp;
-        secondHalfRunning[symbol] = { high: s.ltp, low: s.ltp };
+        captured[symbol] = { open: s.open, high: s.high, low: s.low, close: s.ltp };
+        capturedSecondHalfOpen[symbol] = s.ltp;
+        capturedSecondHalfRunning[symbol] = { high: s.ltp, low: s.ltp };
       }
     });
-    firstHalfLockedFlag = true;
-    console.log(`First-half (9:15-12:30) locked for ${Object.keys(firstHalfLocked).length} symbol(s) (indices + ${multiStrikeSymbolList.length} tracked strikes).`);
+    const gotAnyData = Object.keys(captured).length > 0;
+    const pastHardCutoff = minutes >= FIRST_HALF_LOCK_HARD_CUTOFF_MINUTES;
+
+    if(gotAnyData || pastHardCutoff){
+      firstHalfLocked = captured;
+      secondHalfOpen = capturedSecondHalfOpen;
+      secondHalfRunning = capturedSecondHalfRunning;
+      firstHalfLockedFlag = true;
+      if(gotAnyData){
+        console.log(`First-half (9:15-12:30) locked for ${Object.keys(firstHalfLocked).length} symbol(s) (indices + ${multiStrikeSymbolList.length} tracked strikes).`);
+      } else {
+        console.log(`First-half (9:15-12:30): no symbol had live data by the hard cutoff — giving up for today (likely a restart well after this window).`);
+      }
+    }
+    // else: keep retrying next cycle - the connection may still be establishing
   }
 }
 
@@ -1243,30 +1329,44 @@ function rollMultiStrikeIntoYesterday(){
 function checkAndLockSecondHalf(){
   const { minutes } = getISTDateKeyAndMinutes();
   if(!firstHalfLockedFlag || secondHalfLockedFlag) return;
-  if(minutes >= EOD_SNAPSHOT_MINUTES){
-    const allSymbols = [...HALF_DAY_SYMBOLS, ...multiStrikeSymbolList];
-    allSymbols.forEach(symbol => {
-      const s = state[symbol];
-      const running = secondHalfRunning[symbol];
-      const openPrice = secondHalfOpen[symbol];
-      if(s && running && openPrice !== undefined && s.ltp !== null){
-        secondHalfLocked[symbol] = { open: openPrice, high: running.high, low: running.low, close: s.ltp };
-      }
-    });
-    secondHalfLockedFlag = true;
+  if(minutes < EOD_SNAPSHOT_MINUTES) return;
+
+  // Same fix as checkAndLockFirstHalf (2026-08-24) - waits for real data or
+  // a hard cutoff, instead of locking permanently and instantly with
+  // nothing on a late restart.
+  const allSymbols = [...HALF_DAY_SYMBOLS, ...multiStrikeSymbolList];
+  const captured = {};
+  allSymbols.forEach(symbol => {
+    const s = state[symbol];
+    const running = secondHalfRunning[symbol];
+    const openPrice = secondHalfOpen[symbol];
+    if(s && running && openPrice !== undefined && s.ltp !== null){
+      captured[symbol] = { open: openPrice, high: running.high, low: running.low, close: s.ltp };
+    }
+  });
+  const gotAnyData = Object.keys(captured).length > 0;
+  const pastHardCutoff = minutes >= EOD_SNAPSHOT_HARD_CUTOFF_MINUTES;
+
+  if(!gotAnyData && !pastHardCutoff) return; // keep retrying next cycle
+
+  secondHalfLocked = captured;
+  secondHalfLockedFlag = true;
+  if(gotAnyData){
     console.log(`Second-half (12:30-3:30) locked for ${Object.keys(secondHalfLocked).length} symbol(s).`);
-    HALF_DAY_SYMBOLS.forEach(symbol => {
-      if(firstHalfLocked[symbol] || secondHalfLocked[symbol]){
-        yesterdayHalves[symbol] = {
-          firstHalf: firstHalfLocked[symbol] || (yesterdayHalves[symbol] && yesterdayHalves[symbol].firstHalf) || null,
-          secondHalf: secondHalfLocked[symbol] || (yesterdayHalves[symbol] && yesterdayHalves[symbol].secondHalf) || null,
-        };
-      }
-    });
-    rollMultiStrikeIntoYesterday();
-    saveYesterdayHalves();
-    saveYesterdayMultiStrikeHalves();
+  } else {
+    console.log(`Second-half (12:30-3:30): no symbol had live data by the hard cutoff — giving up for today (likely a restart well after this window).`);
   }
+  HALF_DAY_SYMBOLS.forEach(symbol => {
+    if(firstHalfLocked[symbol] || secondHalfLocked[symbol]){
+      yesterdayHalves[symbol] = {
+        firstHalf: firstHalfLocked[symbol] || (yesterdayHalves[symbol] && yesterdayHalves[symbol].firstHalf) || null,
+        secondHalf: secondHalfLocked[symbol] || (yesterdayHalves[symbol] && yesterdayHalves[symbol].secondHalf) || null,
+      };
+    }
+  });
+  rollMultiStrikeIntoYesterday();
+  saveYesterdayHalves();
+  saveYesterdayMultiStrikeHalves();
 }
 
 function checkAndRunEarlyExhaustionScan(){
