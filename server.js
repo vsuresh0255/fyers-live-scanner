@@ -2068,8 +2068,25 @@ function startFyersConnection(accessToken) {
     }, 6000); // was 2000ms — bumped up since even RECONNECTS (not just brand-new logins) were sometimes hitting a -15 "invalid token" rejection on the first subscribe attempt, suggesting Fyers' side needs a bit longer to fully accept a new WS session than 2s reliably provides
   });
 
+// Fyers requires the FULL index symbol format for subscription
+// ("NSE:NIFTY50-INDEX" etc. - bare "NIFTY" is not a valid Fyers symbol,
+// confirmed via Fyers' own community docs), but every OTHER part of this
+// codebase (HALF_DAY_SYMBOLS, discoverAndSubscribeMultiStrikes's indices
+// array, state['NIFTY'] lookups throughout) expects the bare short name as
+// the state key. This map translates an incoming tick's real Fyers symbol
+// back to the bare name the rest of the code relies on - added 2026-08-24
+// after discovering this translation never existed, which meant these
+// three symbols could never populate state at all even once correctly
+// subscribed.
+const INDEX_TICK_SYMBOL_TO_STATE_KEY = {
+  'NSE:NIFTY50-INDEX': 'NIFTY',
+  'NSE:NIFTYBANK-INDEX': 'BANKNIFTY',
+  'BSE:SENSEX-INDEX': 'SENSEX',
+};
+
   fyersSocket.on('message', tick => {
-    const symbol = tick.symbol || tick.s;
+    const rawSymbol = tick.symbol || tick.s;
+    const symbol = (rawSymbol && INDEX_TICK_SYMBOL_TO_STATE_KEY[rawSymbol]) || rawSymbol;
     if (symbol && state[symbol]) {
       updateStateFromTick(symbol, tick);
       lastTickReceivedAt = new Date().toISOString();
