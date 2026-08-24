@@ -143,6 +143,20 @@ if (fs.existsSync(MARKET_CAP_SYMBOLS_PATH)) {
 // ============ live state per symbol ============
 const state = {};
 symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null }; });
+// The 210 stocks use their own Fyers symbol as both the subscribe symbol
+// AND the state key, so the loop above is sufficient for them. The three
+// indices are different: symbols.json now (correctly) holds their real
+// Fyers subscribe symbols ("NSE:NIFTY50-INDEX" etc.), but every OTHER part
+// of this codebase (HALF_DAY_SYMBOLS, discoverAndSubscribeMultiStrikes,
+// state['NIFTY'] lookups throughout) expects the bare short name as the
+// state key - so those bare-name objects need to be created explicitly
+// here too, since nothing in symbols.json literally spells "NIFTY".
+// Missing this was the reason ticks kept arriving (correctly translated
+// by INDEX_TICK_SYMBOL_TO_STATE_KEY below) but were then silently
+// discarded by updateStateFromTick's "if (!s) return" check.
+['NIFTY', 'BANKNIFTY', 'SENSEX'].forEach(s => {
+  if(!state[s]) state[s] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null };
+});
 let lastTickReceivedAt = null; // tracks the last REAL price tick, separate from relay-connection status —
                                  // lets you tell "connected but Fyers feed has gone quiet" apart from
                                  // "genuinely fine, just between ticks"
