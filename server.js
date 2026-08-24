@@ -786,13 +786,25 @@ let multiStrikeSelectedToday = false;
 let multiStrikeDiscoveryInProgress = false;
 let yesterdayMultiStrikeHalves = {};
 
-function fetchUrl(targetUrl){
+// timeoutMs added 2026-08: without this, a hung request (network stall,
+// unresponsive server) never resolves OR rejects the promise — which left
+// discoverAndSubscribeMultiStrikes()'s multiStrikeDiscoveryInProgress flag
+// stuck true forever, silently blocking ATM strike discovery for the rest
+// of the trading day with zero error logged. Confirmed as the root cause
+// of a real incident: the "Multi-strike ATM discovery" log line never
+// appeared once in a full day's log, with no failure message either.
+function fetchUrl(targetUrl, timeoutMs = 15000){
   return new Promise((resolve, reject) => {
-    https.get(targetUrl, (res) => {
+    const req = https.get(targetUrl, (res) => {
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => resolve(data));
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      reject(new Error(`Request to ${targetUrl} timed out after ${timeoutMs}ms`));
+    });
   });
 }
 
@@ -2102,7 +2114,15 @@ function isMarketHoursIST(){
   return isWeekday && istMinutes >= (9*60+15) && istMinutes <= (15*60+30);
 }
 
-const STALL_THRESHOLD_MS = 90 * 1000; // 90 seconds with no real tick = considered stalled
+// 2026-08-24 fix: was 90 seconds, which turned out to be too aggressive —
+// during a real incident, this triggered a forced reconnect roughly every
+// ~3 minutes, continuously, for hours (including right through market
+// open). The reconnect cycle itself takes 6+ seconds before a fresh tick
+// can even arrive, and normal quiet periods across even 210 actively-
+// traded symbols can plausibly exceed 90 seconds without a false "stall".
+// Widened to give real lulls more room, while still catching a genuinely
+// dead connection within a few minutes rather than letting it run all day.
+const STALL_THRESHOLD_MS = 3 * 60 * 1000; // 3 minutes with no real tick = considered stalled
 
 setInterval(() => {
   if(!currentAccessToken || !isMarketHoursIST()) return; // nothing to watch if not logged in or market closed
