@@ -836,9 +836,12 @@ let yesterdayMultiStrikeHalves = {};
 // of the trading day with zero error logged. Confirmed as the root cause
 // of a real incident: the "Multi-strike ATM discovery" log line never
 // appeared once in a full day's log, with no failure message either.
-function fetchUrl(targetUrl, timeoutMs = 15000){
+// Accepts an optional headers object (third param, added 2026-08-24) -
+// existing callers that only pass targetUrl (or targetUrl, timeoutMs)
+// are completely unaffected, since headers defaults to {} either way.
+function fetchUrl(targetUrl, timeoutMs = 15000, headers = {}){
   return new Promise((resolve, reject) => {
-    const req = https.get(targetUrl, (res) => {
+    const req = https.get(targetUrl, { headers }, (res) => {
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => resolve(data));
@@ -1033,6 +1036,195 @@ async function checkAndFetchBhavcopy(){
       console.log(`Bhavcopy auto-fetch: giving up for today after repeated failures past the hard cutoff. Last error: ${err.message}`);
     } else {
       console.log(`Bhavcopy auto-fetch attempt failed (will retry in ${BHAVCOPY_RETRY_INTERVAL_MS/60000} min): ${err.message}`);
+    }
+  }
+}
+
+// ============================================================
+// Automatic delivery-data (sec_bhavdata_full) fetching — 2026-08-24
+// =====================================================================
+// Same pattern as the bhavcopy fetcher (session cookie + User-Agent, wait/
+// retry/hard-cutoff scheduling), for NSE's separate securities delivery-%
+// report - a plain CSV, not zipped, at a confirmed URL (already verified
+// working via the standalone delivery_data_fetcher.py script built earlier
+// today, which uses this exact same URL pattern and cookie-warmup trick).
+// Unlike bhavcopy, this is processed into its final deliveryMap shape
+// server-side (matching the Setup page's own upload-parsing logic exactly:
+// filter to SERIES==='EQ', keep delivPer + closePrice per symbol) - the
+// result is small (~200 symbols, not 36,000 rows), so it's broadcast
+// directly rather than needing a separate on-demand endpoint like bhavcopy.
+// ============================================================
+let deliveryMapData = { deliveryMap: null, fetchedAt: null, fetchDateKey: null };
+let deliveryFetchDoneToday = false;
+let deliveryFetchDateKey = null;
+let deliveryLastAttemptAt = 0;
+
+function buildSecBhavdataUrl(dateObj){
+  const pad = n => String(n).padStart(2, '0');
+  const dd = pad(dateObj.getDate());
+  const mm = pad(dateObj.getMonth() + 1);
+  const yyyy = dateObj.getFullYear();
+  return `https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_${dd}${mm}${yyyy}.csv`;
+}
+
+async function fetchAndParseDeliveryData(){
+  const now = new Date();
+  const url = buildSecBhavdataUrl(now);
+
+  let cookie = '';
+  try{
+    cookie = await establishNseSession();
+  } catch(err){
+    console.log(`Delivery data: could not establish an NSE session cookie (continuing without one): ${err.message}`);
+  }
+  const headers = { 'User-Agent': NSE_USER_AGENT };
+  if(cookie) headers['Cookie'] = cookie;
+
+  const csvText = await fetchUrl(url, 15000, headers);
+
+  const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true, transformHeader: h => h.replace(/^\uFEFF/, '').trim() });
+  if(!parsed.data || parsed.data.length === 0){
+    throw new Error('Parsed delivery CSV has zero rows - something is wrong with the downloaded file');
+  }
+
+  // exact same filter/shape as the Setup page's own manual-upload logic
+  const deliveryMap = {};
+  let count = 0;
+  parsed.data.forEach(row => {
+    const series = (row.SERIES || '').trim();
+    if(series !== 'EQ') return;
+    const symbol = (row.SYMBOL || '').trim();
+    const delivPer = parseFloat(row.DELIV_PER);
+    const closePrice = parseFloat(row.CLOSE_PRICE);
+    if(!symbol || isNaN(delivPer)) return;
+    deliveryMap[symbol] = { delivPer, closePrice };
+    count++;
+  });
+  if(count === 0){
+    throw new Error('Delivery CSV parsed but zero EQ-series symbols found - check the file format hasn\'t changed');
+  }
+  return deliveryMap;
+}
+
+async function checkAndFetchDeliveryData(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(deliveryFetchDateKey !== dateKey){
+    deliveryFetchDateKey = dateKey;
+    deliveryFetchDoneToday = false;
+  }
+
+  if(deliveryFetchDoneToday || minutes < BHAVCOPY_FETCH_START_MINUTES) return; // same 4:15 PM start as bhavcopy
+
+  const nowMs = Date.now();
+  if(nowMs - deliveryLastAttemptAt < BHAVCOPY_RETRY_INTERVAL_MS) return;
+  deliveryLastAttemptAt = nowMs;
+
+  try{
+    const deliveryMap = await fetchAndParseDeliveryData();
+    deliveryMapData = { deliveryMap, fetchedAt: new Date().toISOString(), fetchDateKey: dateKey };
+    deliveryFetchDoneToday = true;
+    console.log(`Delivery data auto-fetched successfully: ${Object.keys(deliveryMap).length} symbols for ${dateKey}.`);
+    saveDeliveryMapData();
+  } catch(err){
+    if(minutes >= BHAVCOPY_FETCH_HARD_CUTOFF_MINUTES){
+      deliveryFetchDoneToday = true;
+      console.log(`Delivery data auto-fetch: giving up for today after repeated failures past the hard cutoff. Last error: ${err.message}`);
+    } else {
+      console.log(`Delivery data auto-fetch attempt failed (will retry in ${BHAVCOPY_RETRY_INTERVAL_MS/60000} min): ${err.message}`);
+    }
+  }
+}
+
+// ============================================================
+// Automatic FOVOLT (F&O volatility) fetching — 2026-08-25
+// =====================================================================
+// URL confirmed genuinely working via a real, successful download in an
+// earlier session (38,851 bytes, not an error page) - NOT a guess:
+//   https://nsearchives.nseindia.com/archives/nsccl/volt/FOVOLT_{ddmmyyyy}.csv
+// Same session-cookie + User-Agent approach as bhavcopy and delivery data.
+// Parsing matches the Setup page's own exact logic: raw comma-split lines
+// (not header-based), skip line 1, column[1]=symbol, column[14]=daily vol,
+// column[15]=annual vol (both stored as already-multiplied-by-100
+// percentages, matching the Setup page's own dailyVolPct/annualVolPct
+// naming and shape exactly). Small payload (~200 symbols) - broadcast
+// directly, same as deliveryMap, no separate endpoint needed.
+// ============================================================
+let volatilityMapData = { volatilityMap: null, fetchedAt: null, fetchDateKey: null };
+let volatilityFetchDoneToday = false;
+let volatilityFetchDateKey = null;
+let volatilityLastAttemptAt = 0;
+
+function buildFovoltUrl(dateObj){
+  const pad = n => String(n).padStart(2, '0');
+  const dd = pad(dateObj.getDate());
+  const mm = pad(dateObj.getMonth() + 1);
+  const yyyy = dateObj.getFullYear();
+  return `https://nsearchives.nseindia.com/archives/nsccl/volt/FOVOLT_${dd}${mm}${yyyy}.csv`;
+}
+
+async function fetchAndParseVolatilityData(){
+  const now = new Date();
+  const url = buildFovoltUrl(now);
+
+  let cookie = '';
+  try{
+    cookie = await establishNseSession();
+  } catch(err){
+    console.log(`FOVOLT: could not establish an NSE session cookie (continuing without one): ${err.message}`);
+  }
+  const headers = { 'User-Agent': NSE_USER_AGENT };
+  if(cookie) headers['Cookie'] = cookie;
+
+  const text = await fetchUrl(url, 15000, headers);
+
+  // exact same parsing as the Setup page's own manual-upload logic - raw
+  // comma-split by position, NOT PapaParse/header-based
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const volatilityMap = {};
+  let count = 0;
+  for(let i = 1; i < lines.length; i++){
+    const cols = lines[i].split(',').map(c => c.trim());
+    if(cols.length < 16) continue;
+    const symbol = cols[1];
+    const dailyVol = parseFloat(cols[14]);
+    const annualVol = parseFloat(cols[15]);
+    if(!symbol || isNaN(dailyVol)) continue;
+    volatilityMap[symbol] = { dailyVolPct: dailyVol*100, annualVolPct: annualVol*100 };
+    count++;
+  }
+  if(count === 0){
+    throw new Error('FOVOLT file parsed but zero symbols found - check the file format hasn\'t changed');
+  }
+  return volatilityMap;
+}
+
+async function checkAndFetchVolatilityData(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(volatilityFetchDateKey !== dateKey){
+    volatilityFetchDateKey = dateKey;
+    volatilityFetchDoneToday = false;
+  }
+
+  if(volatilityFetchDoneToday || minutes < BHAVCOPY_FETCH_START_MINUTES) return;
+
+  const nowMs = Date.now();
+  if(nowMs - volatilityLastAttemptAt < BHAVCOPY_RETRY_INTERVAL_MS) return;
+  volatilityLastAttemptAt = nowMs;
+
+  try{
+    const volatilityMap = await fetchAndParseVolatilityData();
+    volatilityMapData = { volatilityMap, fetchedAt: new Date().toISOString(), fetchDateKey: dateKey };
+    volatilityFetchDoneToday = true;
+    console.log(`FOVOLT auto-fetched successfully: ${Object.keys(volatilityMap).length} symbols for ${dateKey}.`);
+    saveVolatilityMapData();
+  } catch(err){
+    if(minutes >= BHAVCOPY_FETCH_HARD_CUTOFF_MINUTES){
+      volatilityFetchDoneToday = true;
+      console.log(`FOVOLT auto-fetch: giving up for today after repeated failures past the hard cutoff. Last error: ${err.message}`);
+    } else {
+      console.log(`FOVOLT auto-fetch attempt failed (will retry in ${BHAVCOPY_RETRY_INTERVAL_MS/60000} min): ${err.message}`);
     }
   }
 }
@@ -1868,6 +2060,66 @@ function saveBhavcopyData(){
 
 loadBhavcopyData();
 
+const DELIVERY_MAP_PERSIST_FILE = path.join(PERSIST_DIR, 'delivery_map_data.json');
+
+function loadDeliveryMapData(){
+  try{
+    if(!fs.existsSync(DELIVERY_MAP_PERSIST_FILE)) {
+      console.log('No persisted delivery-map data found — will auto-fetch fresh starting at 4:15 PM today.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(DELIVERY_MAP_PERSIST_FILE, 'utf8'));
+    deliveryMapData = saved.deliveryMapData || deliveryMapData;
+    deliveryFetchDoneToday = saved.fetchDateKey === todayDateKey();
+    deliveryFetchDateKey = saved.fetchDateKey || null;
+    console.log(`Restored delivery-map data from disk (last fetched: ${deliveryMapData.fetchedAt || 'never'}, for ${deliveryMapData.fetchDateKey || 'n/a'}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted delivery-map data (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveDeliveryMapData(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { deliveryMapData, fetchDateKey: deliveryFetchDateKey };
+    fs.writeFileSync(DELIVERY_MAP_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save delivery-map data to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadDeliveryMapData();
+
+const VOLATILITY_MAP_PERSIST_FILE = path.join(PERSIST_DIR, 'volatility_map_data.json');
+
+function loadVolatilityMapData(){
+  try{
+    if(!fs.existsSync(VOLATILITY_MAP_PERSIST_FILE)) {
+      console.log('No persisted volatility-map data found — will auto-fetch fresh starting at 4:15 PM today.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(VOLATILITY_MAP_PERSIST_FILE, 'utf8'));
+    volatilityMapData = saved.volatilityMapData || volatilityMapData;
+    volatilityFetchDoneToday = saved.fetchDateKey === todayDateKey();
+    volatilityFetchDateKey = saved.fetchDateKey || null;
+    console.log(`Restored volatility-map data from disk (last fetched: ${volatilityMapData.fetchedAt || 'never'}, for ${volatilityMapData.fetchDateKey || 'n/a'}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted volatility-map data (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveVolatilityMapData(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { volatilityMapData, fetchDateKey: volatilityFetchDateKey };
+    fs.writeFileSync(VOLATILITY_MAP_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save volatility-map data to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadVolatilityMapData();
+
 // first5MinLocked previously had NO disk persistence at all — a same-day
 // restart after 9:20 AM (e.g. a code redeploy in the afternoon) silently
 // wiped today's already-locked first-5-min candle for every symbol, with
@@ -2310,6 +2562,8 @@ function recordMinuteSlot(){
   checkAndRunNarrowCamarillaLock();
   checkAndLockTop3Losers916();
   checkAndFetchBhavcopy();
+  checkAndFetchDeliveryData();
+  checkAndFetchVolatilityData();
   checkAndLockFirst5MinCandle();
   checkAndLockFirst15MinCandle();
   checkAndRunScreenerScan15m();
@@ -3020,6 +3274,19 @@ function buildPayload(){
       fetchDateKey: bhavcopyData.fetchDateKey,
       rowCount: bhavcopyData.nseRows ? bhavcopyData.nseRows.length : 0,
       prevRowCount: bhavcopyData.nseRowsPrev ? bhavcopyData.nseRowsPrev.length : 0,
+    },
+    // Unlike bhavcopy, deliveryMap is small (~200 symbols, not tens of
+    // thousands of rows) - safe to include in full on every broadcast
+    // rather than needing a separate on-demand endpoint.
+    deliveryMapUpdate: {
+      deliveryMap: deliveryMapData.deliveryMap,
+      fetchedAt: deliveryMapData.fetchedAt,
+      fetchDateKey: deliveryMapData.fetchDateKey,
+    },
+    volatilityMapUpdate: {
+      volatilityMap: volatilityMapData.volatilityMap,
+      fetchedAt: volatilityMapData.fetchedAt,
+      fetchDateKey: volatilityMapData.fetchDateKey,
     },
     // Full quote list for every tracked symbol (not just screener matches) —
     // needed by tools like the Gann Square of 9 calculator, which computes
