@@ -751,6 +751,7 @@ let strongWeakAlertLog = []; // { time, symbol, statusEvent: 'Strong'|'Weak', lt
 const VOL_CHANGE_JUMP_THRESHOLD_PCT = 50;   // Vol Change % moving by more than 50 percentage points
 const VOL_RATIO_JUMP_THRESHOLD = 1.0;       // Volume Ratio moving by more than 1.0x
 let previousVolMetrics = {}; // { [symbol]: { volumeChangePct, volumeRatio } } - last reading seen, for detecting a jump
+let lastVolJumpCheckBucket = {}; // { [symbol]: 5-min bucket index } - gates the comparison to once per completed 5-min candle, not every tick
 
 function resetStrongWeakIfNewDay(){
   const { dateKey } = getISTDateKeyAndMinutes();
@@ -767,6 +768,7 @@ function resetStrongWeakIfNewDay(){
     pendingNotifications = [];
     strongWeakAlertLog = [];
     previousVolMetrics = {};
+    lastVolJumpCheckBucket = {};
   }
 }
 
@@ -866,29 +868,40 @@ function buildOneStrongWeakRow(symbol, s, minutes, inNoteWindow){
   }
 
   // Big-jump alert: compare this reading to the last one seen for this
-  // symbol today. Fires independently for each metric (a big Vol Change %
-  // move and a big Volume Ratio move are different signals, worth
-  // separate alerts). Always updates previousVolMetrics after checking,
-  // whether or not a jump fired - so a value that jumps once and then
-  // stays elevated doesn't keep re-alerting every tick.
-  const prevVol = previousVolMetrics[symbol];
-  if(prevVol){
-    if(volumeChangePct != null && prevVol.volumeChangePct != null){
-      const delta = volumeChangePct - prevVol.volumeChangePct;
-      if(Math.abs(delta) >= VOL_CHANGE_JUMP_THRESHOLD_PCT){
-        const arrow = delta > 0 ? '📈' : '📉';
-        pendingNotifications.push(`${arrow} BIG VOL CHANGE JUMP: ${symbol} — Vol Chg% moved ${delta > 0 ? '+' : ''}${delta.toFixed(1)} points (${prevVol.volumeChangePct.toFixed(1)}% → ${volumeChangePct.toFixed(1)}%) at LTP ${ltp} — ${timeLabel()}`);
+  // symbol today. Gated to run at most ONCE per completed 5-min candle,
+  // not on every tick - the still-forming current candle's volume keeps
+  // changing tick-by-tick, which would otherwise fire this comparison
+  // many times within a single 5-min window (effectively 1-min-or-finer
+  // frequency, even though the underlying metric is a 5-min one).
+  // Fires independently for each metric (a big Vol Change % move and a
+  // big Volume Ratio move are different signals, worth separate alerts).
+  // Always updates previousVolMetrics after checking, whether or not a
+  // jump fired - so a value that jumps once and then stays elevated
+  // doesn't keep re-alerting every 5-min candle either.
+  const { minutes: currentMinutes } = getISTDateKeyAndMinutes();
+  const currentBucket = Math.floor(currentMinutes / 5);
+  if(lastVolJumpCheckBucket[symbol] !== currentBucket){
+    lastVolJumpCheckBucket[symbol] = currentBucket;
+
+    const prevVol = previousVolMetrics[symbol];
+    if(prevVol){
+      if(volumeChangePct != null && prevVol.volumeChangePct != null){
+        const delta = volumeChangePct - prevVol.volumeChangePct;
+        if(Math.abs(delta) >= VOL_CHANGE_JUMP_THRESHOLD_PCT){
+          const arrow = delta > 0 ? '📈' : '📉';
+          pendingNotifications.push(`${arrow} BIG VOL CHANGE JUMP: ${symbol} — Vol Chg% moved ${delta > 0 ? '+' : ''}${delta.toFixed(1)} points (${prevVol.volumeChangePct.toFixed(1)}% → ${volumeChangePct.toFixed(1)}%) at LTP ${ltp} — ${timeLabel()}`);
+        }
+      }
+      if(volumeRatio != null && prevVol.volumeRatio != null){
+        const delta = volumeRatio - prevVol.volumeRatio;
+        if(Math.abs(delta) >= VOL_RATIO_JUMP_THRESHOLD){
+          const arrow = delta > 0 ? '📈' : '📉';
+          pendingNotifications.push(`${arrow} BIG VOLUME RATIO JUMP: ${symbol} — Vol Ratio moved ${delta > 0 ? '+' : ''}${delta.toFixed(2)}x (${prevVol.volumeRatio.toFixed(2)}x → ${volumeRatio.toFixed(2)}x) at LTP ${ltp} — ${timeLabel()}`);
+        }
       }
     }
-    if(volumeRatio != null && prevVol.volumeRatio != null){
-      const delta = volumeRatio - prevVol.volumeRatio;
-      if(Math.abs(delta) >= VOL_RATIO_JUMP_THRESHOLD){
-        const arrow = delta > 0 ? '📈' : '📉';
-        pendingNotifications.push(`${arrow} BIG VOLUME RATIO JUMP: ${symbol} — Vol Ratio moved ${delta > 0 ? '+' : ''}${delta.toFixed(2)}x (${prevVol.volumeRatio.toFixed(2)}x → ${volumeRatio.toFixed(2)}x) at LTP ${ltp} — ${timeLabel()}`);
-      }
-    }
+    previousVolMetrics[symbol] = { volumeChangePct, volumeRatio };
   }
-  previousVolMetrics[symbol] = { volumeChangePct, volumeRatio };
 
   const pivots = yest ? computeClassicPivots(yest.high, yest.low, yest.close) : null;
   const pivotDesc = pivots ? describePivotPosition(ltp, pivots) : '—';
