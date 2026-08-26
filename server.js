@@ -99,7 +99,17 @@ const RELAY_TOKEN = process.env.RELAY_TOKEN;
 // one-time notice and continues running normally with notifications off —
 // this was deliberately made non-fatal, unlike the Fyers credentials above,
 // since notifications are a nice-to-have, not core to the app working.
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+//
+// 2026-08-25: disabled entirely (TELEGRAM_NOTIFICATIONS_ENABLED = false)
+// at your request, to cut Railway network/CPU consumption - the unresolved
+// 429-flood issue meant hundreds of outbound requests to api.telegram.org
+// per 5-min window, many failing, which is real, billable network/CPU
+// usage even when a send fails. This single flag is the master switch -
+// flip it back to true (and set TELEGRAM_BOT_TOKEN again in Railway) to
+// restore notifications later, once the setup is revisited - no other
+// code changes needed.
+const TELEGRAM_NOTIFICATIONS_ENABLED = false;
+const TELEGRAM_BOT_TOKEN = TELEGRAM_NOTIFICATIONS_ENABLED ? process.env.TELEGRAM_BOT_TOKEN : null;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '-1001816364014';
 
 let currentAccessToken = null; // stored after daily login, needed for placing orders
@@ -109,7 +119,9 @@ if (!APP_ID || !SECRET_KEY || !REDIRECT_URI || !RELAY_TOKEN) {
   process.exit(1);
 }
 
-if (!TELEGRAM_BOT_TOKEN) {
+if (!TELEGRAM_NOTIFICATIONS_ENABLED) {
+  console.log('Telegram notifications are disabled (TELEGRAM_NOTIFICATIONS_ENABLED = false in server.js) — no outbound Telegram requests will be made. Set it back to true to re-enable.');
+} else if (!TELEGRAM_BOT_TOKEN) {
   console.log('TELEGRAM_BOT_TOKEN not set — Strong/Weak Scanner Telegram notifications are disabled. Set it in Railway Variables to enable them.');
 }
 
@@ -282,8 +294,15 @@ function sendOpenEqScreenerAlert(label, emoji, list, lockTime){
 // notifications trend_scanner.js queued up since the last check, and sends
 // each one. Safe to call even when nothing's pending (drainPendingNotifications
 // returns an empty array in that case, this is then a no-op).
+// 2026-08-25 fix: this used to gate on TELEGRAM_BOT_TOKEN too, meaning
+// drainPendingNotifications() never ran at all when Telegram was disabled -
+// silently leaving trend_scanner.js's pendingNotifications array to grow
+// unbounded all day, never drained. Now this always drains it regardless of
+// whether Telegram is enabled; sendTelegramMessage's own gate is what
+// actually decides whether anything gets sent, so no messages go out
+// either way while disabled - this just also stops the memory growth.
 function checkAndSendStrongWeakNotifications(){
-  if(!trendScannerAvailable || !TELEGRAM_BOT_TOKEN) return;
+  if(!trendScannerAvailable) return;
   const messages = trendScanner.drainPendingNotifications();
   messages.forEach(msg => sendTelegramMessage(msg));
 }
