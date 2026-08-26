@@ -1268,6 +1268,19 @@ function computeTop3LosersAt916(stateRef){
   return { rows: top3 };
 }
 
+// Exposes the full today-so-far 5-min candle history for one symbol, so
+// consumers (like the ISP Selector page) can search across successive
+// candles rather than only ever seeing the first one. resetIntradayCandlesIfNewDay()
+// already clears this array daily, so it's inherently "today only".
+// Capped at maxCandles (default 40 = ~200 minutes, 9:15 AM to 12:35 PM) -
+// this gets broadcast on every tick across ~250 tracked strikes, so an
+// unbounded, all-day-growing array here would repeat the same payload-size
+// mistake already caught and fixed for bhavcopy earlier today.
+function getFiveMinCandles(symbol, maxCandles = 40){
+  const all = candles['5m'][symbol] || [];
+  return all.length > maxCandles ? all.slice(all.length - maxCandles) : all;
+}
+
 module.exports = {
   processTick,
   backfillHistory,
@@ -1279,6 +1292,7 @@ module.exports = {
   getNarrowCamarillaPayload,
   computeTop3LosersAt916,
   drainPendingNotifications,
+  getFiveMinCandles,
   // Exported specifically so backtest_strong_weak.js can reuse the EXACT
   // same pure math/classification functions the live app uses — a backtest
   // that reimplemented this logic separately could silently drift out of
