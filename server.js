@@ -3155,6 +3155,11 @@ function buildMultiStrikeHalfDayLevels(){
       secondHalf: secondHalfLocked[symbol] || (yData && yData.secondHalf) || null,
       secondHalfIsToday: !!secondHalfLocked[symbol],
       first5Min: first5MinLocked[symbol] || null,
+      // 2026-08-25: full today-so-far 5-min candle history, not just the
+      // first candle - lets the ISP Selector page search across successive
+      // candles for the one where its containment condition is first met,
+      // instead of only ever seeing whatever the current candle shows.
+      todayFiveMinCandles: trendScannerAvailable ? trendScanner.getFiveMinCandles(symbol) : [],
     };
   });
 
