@@ -3526,6 +3526,19 @@ wss.on('connection', (ws, req) => {
 });
 
 function broadcastScreeners() {
+  // 2026-08-28: skip the (expensive) payload computation when no browser
+  // is actually connected to receive it - previously ran every second
+  // regardless, wasting CPU for nothing whenever no tab was open
+  // (overnight, or simply between sessions). Still drains pending
+  // notifications regardless (cheap - just array operations), since that
+  // was specifically fixed earlier to prevent unbounded growth if nothing
+  // ever calls it - skipping the whole function here would have quietly
+  // reintroduced that exact problem during any stretch with zero clients.
+  if (wss.clients.size === 0) {
+    checkAndSendStrongWeakNotifications();
+    return;
+  }
+
   // Only pay the cost of computing the full (option-strike-inclusive)
   // payload if at least one currently-connected client actually wants it -
   // no point building it when no ISP page is open right now.
