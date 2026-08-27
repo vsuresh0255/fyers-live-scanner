@@ -3276,7 +3276,35 @@ const server = http.createServer(async (req, res) => {
 // tracking). Path validated explicitly in the connection handler below,
 // since removing the `path` option here means this now accepts any path
 // reaching this server and must self-police which ones are legitimate.
-const wss = new WebSocket.Server({ server });
+// 2026-08-28: perMessageDeflate enabled - was previously off entirely
+// (ws defaults to no compression unless explicitly configured), meaning
+// every broadcast went out as raw, uncompressed JSON text. Confirmed via
+// Railway's own cost breakdown that egress is ~91% of total spend ($5.14
+// of $5.64) - by far the dominant cost, not CPU/RAM. This JSON payload
+// (hundreds of similarly-shaped objects with repeated key names) is
+// exactly the kind of data that compresses very well with deflate - a
+// native WebSocket protocol extension, handled transparently by every
+// browser's built-in WebSocket implementation with zero client-side code
+// changes needed. Settings match ws's own documented recommendation for
+// balancing compression ratio against CPU/memory overhead.
+const wss = new WebSocket.Server({
+  server,
+  perMessageDeflate: {
+    zlibDeflateOptions: {
+      chunkSize: 1024,
+      memLevel: 7,
+      level: 3,
+    },
+    zlibInflateOptions: {
+      chunkSize: 10 * 1024,
+    },
+    clientNoContextTakeover: true,
+    serverNoContextTakeover: true,
+    serverMaxWindowBits: 10,
+    concurrencyLimit: 10,
+    threshold: 1024, // don't bother compressing tiny messages - not worth the overhead
+  },
+});
 
 function buildHalfDayLevels(){
   const result = {};
