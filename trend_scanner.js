@@ -612,9 +612,19 @@ function computeTimeframeIndicators(timeframe, symbol, includeVwap, ltp){
 
 // `state` is server.js's existing per-symbol state object ({open,high,low,ltp,...}),
 // passed in so this module doesn't need its own separate LTP tracking.
+// 2026-08-28: same index-exclusion list as server.js's INDEX_STATE_KEYS -
+// getScannerPayload() below iterates candles['D'] directly (built
+// independently via backfillHistory for every symbol.json entry,
+// including the 3 indices), not just stateRef - so filtering stateRef
+// alone wasn't enough to keep indices out of this particular screener's
+// results. Kept as its own local list here rather than importing from
+// server.js, since this module has no dependency on that file otherwise.
+const INDEX_SYMBOLS_TO_EXCLUDE = ['NSE:NIFTY50-INDEX', 'NSE:NIFTYBANK-INDEX', 'BSE:SENSEX-INDEX', 'NIFTY', 'BANKNIFTY', 'SENSEX'];
+
 function getScannerPayload(stateRef){
   const rows = [];
-  const symbols = Object.keys(candles['D']).length ? Object.keys(candles['D']) : Object.keys(stateRef || {});
+  const symbols = (Object.keys(candles['D']).length ? Object.keys(candles['D']) : Object.keys(stateRef || {}))
+    .filter(s => !INDEX_SYMBOLS_TO_EXCLUDE.includes(s));
 
   symbols.forEach(symbol => {
     const s = stateRef ? stateRef[symbol] : null;
