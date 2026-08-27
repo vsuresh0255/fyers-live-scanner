@@ -3162,6 +3162,19 @@ function buildMultiStrikeHalfDayLevels(){
   const result = { NIFTY: [], BANKNIFTY: [], SENSEX: [] };
   const bySymbol = {};
 
+  // 2026-08-28: todayFiveMinCandles is only needed while the ISP Selector's
+  // per-candle search could still plausibly be running - realistically
+  // resolved well within the first hour or two of trading, per everything
+  // observed so far. Broadcasting a ~500-600KB slice of this every second,
+  // all day, for the remaining ~4+ hours after that window has passed was
+  // pure waste - confirmed as a real contributor after a genuine
+  // out-of-memory crash during market hours (2026-08-27, see server logs).
+  // Cutting this off after 11:00 AM IST removes that ongoing cost for the
+  // rest of the day while keeping the full search capability during the
+  // window that actually needs it.
+  const { minutes: nowMinutes } = getISTDateKeyAndMinutes();
+  const includeFiveMinCandles = nowMinutes < (11 * 60); // before 11:00 AM IST
+
   multiStrikeSymbolList.forEach(symbol => {
     const meta = multiStrikeMeta[symbol];
     if(!meta) return;
@@ -3178,7 +3191,7 @@ function buildMultiStrikeHalfDayLevels(){
       // first candle - lets the ISP Selector page search across successive
       // candles for the one where its containment condition is first met,
       // instead of only ever seeing whatever the current candle shows.
-      todayFiveMinCandles: trendScannerAvailable ? trendScanner.getFiveMinCandles(symbol) : [],
+      todayFiveMinCandles: (includeFiveMinCandles && trendScannerAvailable) ? trendScanner.getFiveMinCandles(symbol) : [],
     };
   });
 
