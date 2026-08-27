@@ -93,6 +93,19 @@ function getISTDateKeyAndMinutes(){
   return { dateKey, minutes, epochSeconds };
 }
 
+// Same IST date-key logic as above, but for an arbitrary epoch-seconds
+// timestamp rather than "now" - needed to check whether a given daily
+// candle's date is today's, since Fyers' historical daily-candle API can
+// include today's still-forming candle as the most recent entry when
+// queried mid-session (e.g. after a crash-restart, per backfillHistory's
+// `to=nowSeconds` range). Used to guard against treating today's own
+// partial day as "yesterday" - see getMostRecentCompletedDailyCandle below.
+function istDateKeyForEpoch(epochSeconds){
+  const istMillis = epochSeconds * 1000 + (5.5 * 60 * 60 * 1000);
+  const ist = new Date(istMillis);
+  return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth()+1).padStart(2,'0')}-${String(ist.getUTCDate()).padStart(2,'0')}`;
+}
+
 // "HH:MM" for the current IST time — a local equivalent of server.js's own
 // timeLabel(), since that function lives in server.js and isn't available
 // to this module.
@@ -1133,6 +1146,29 @@ function getBtstVolumeRatioPayload(stateRef){
 const NARROW_CPR_PRICE_MIN = 500, NARROW_CPR_PRICE_MAX = 10000;
 const NARROW_CPR_WIDTH_RATIO_THRESHOLD = 10;
 
+// 2026-08-28: candles['D'][symbol] is populated by backfillHistory(),
+// which queries Fyers up to `nowSeconds` - if that backfill happens to
+// run mid-session (e.g. after a crash-restart), Fyers' historical daily
+// API can return TODAY's own still-forming candle as the most recent
+// entry. Both buildOneNarrowCprRow and buildOneNarrowCamarillaRow used to
+// blindly trust dailyArr[dailyArr.length-1] as "yesterday" - if that was
+// actually today's own partial day, today's-CPR and tomorrow's-projected-
+// CPR would both be computed from nearly the same data, making the 10x
+// width-ratio threshold effectively impossible to pass. Confirmed as the
+// likely cause of a real discrepancy (0 matches here vs 8 on an
+// independent third-party screener the same day, following a
+// crash-restart earlier that day). This explicitly excludes any candle
+// dated today before treating the last one as "yesterday".
+function getMostRecentCompletedDailyCandle(symbol){
+  const dailyArr = candles['D'][symbol] || [];
+  if(dailyArr.length === 0) return null;
+  const { dateKey: todayKey } = getISTDateKeyAndMinutes();
+  for(let i = dailyArr.length - 1; i >= 0; i--){
+    if(istDateKeyForEpoch(dailyArr[i].time) !== todayKey) return dailyArr[i];
+  }
+  return null; // every stored daily candle is dated today - genuinely nothing to use yet
+}
+
 function computeCPR(dayCandle){
   const pivot = (dayCandle.high + dayCandle.low + dayCandle.close) / 3;
   const bc = (dayCandle.high + dayCandle.low) / 2;
@@ -1145,10 +1181,8 @@ function buildOneNarrowCprRow(symbol, s){
   if(s.ltp == null || s.high == null || s.low == null || s.open == null) return null;
   if(s.ltp <= NARROW_CPR_PRICE_MIN || s.ltp >= NARROW_CPR_PRICE_MAX) return null;
 
-  const dailyArr = candles['D'][symbol] || [];
-  if(dailyArr.length < 1) return null; // need at least 1 completed daily candle - only "yesterday" is ever read below
-
-  const yesterday = dailyArr[dailyArr.length - 1]; // most recent COMPLETED daily candle
+  const yesterday = getMostRecentCompletedDailyCandle(symbol);
+  if(!yesterday) return null; // no genuinely-completed daily candle available yet
   const todayCPR = computeCPR(yesterday); // "today's" own CPR, from yesterday's H/L/C
 
   // "tomorrow's" PROJECTED CPR, from TODAY's still-forming H/L/C (updates live all day)
@@ -1197,10 +1231,8 @@ function computeCamarilla(h, l, c){
 function buildOneNarrowCamarillaRow(symbol, s){
   if(s.ltp == null || s.high == null || s.low == null) return null;
 
-  const dailyArr = candles['D'][symbol] || [];
-  if(dailyArr.length < 1) return null; // need at least 1 completed daily candle ("yesterday")
-
-  const yesterday = dailyArr[dailyArr.length - 1];
+  const yesterday = getMostRecentCompletedDailyCandle(symbol);
+  if(!yesterday) return null; // no genuinely-completed daily candle available yet
   if(yesterday.high <= 0 || yesterday.low <= 0 || yesterday.close <= 0) return null;
   const camYesterday = computeCamarilla(yesterday.high, yesterday.low, yesterday.close);
 
