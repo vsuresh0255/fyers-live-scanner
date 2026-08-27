@@ -171,6 +171,23 @@ symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null
 ['NIFTY', 'BANKNIFTY', 'SENSEX'].forEach(s => {
   if(!state[s]) state[s] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null };
 });
+
+// 2026-08-28: indices exist in `state` twice (see comment above) - once
+// under their real Fyers symbol, once under the bare short name - so both
+// forms need excluding here. Used by every screener page EXCEPT the 5
+// ISP-related ones, which still work from the full `state` object
+// directly and are unaffected by this. Rebuilt fresh on every call since
+// `state` itself changes constantly - cheap, since it's just excluding 6
+// keys from a ~213-entry object, not deep-cloning anything.
+const INDEX_STATE_KEYS = ['NSE:NIFTY50-INDEX', 'NSE:NIFTYBANK-INDEX', 'BSE:SENSEX-INDEX', 'NIFTY', 'BANKNIFTY', 'SENSEX'];
+function getStockOnlyState(){
+  const filtered = {};
+  Object.keys(state).forEach(key => {
+    if(!INDEX_STATE_KEYS.includes(key)) filtered[key] = state[key];
+  });
+  return filtered;
+}
+
 let lastTickReceivedAt = null; // tracks the last REAL price tick, separate from relay-connection status —
                                  // lets you tell "connected but Fyers feed has gone quiet" apart from
                                  // "genuinely fine, just between ticks"
@@ -426,7 +443,7 @@ function checkAndRunBtstLock(){
   }
 
   if(!btstLockDone && minutes >= BTST_LOCK_TIME_MINUTES){
-    const payload = trendScannerAvailable ? trendScanner.getBtstVolumeRatioPayload(state) : { rows: [] };
+    const payload = trendScannerAvailable ? trendScanner.getBtstVolumeRatioPayload(getStockOnlyState()) : { rows: [] };
     btstLockedRows = payload.rows.filter(r => r.volumeRatio > BTST_VOLUME_RATIO_THRESHOLD);
     btstLockDone = true;
     btstLockTimestamp = timeLabel();
@@ -457,7 +474,7 @@ function checkAndRunNarrowCprLock(){
   }
 
   if(!narrowCprLockDone && minutes >= NARROW_CPR_LOCK_TIME_MINUTES){
-    const payload = trendScannerAvailable ? trendScanner.getNarrowCprPayload(state) : { rows: [] };
+    const payload = trendScannerAvailable ? trendScanner.getNarrowCprPayload(getStockOnlyState()) : { rows: [] };
     narrowCprLockedRows = payload.rows;
     narrowCprLockDone = true;
     narrowCprLockTimestamp = timeLabel();
@@ -490,7 +507,7 @@ function checkAndRunNarrowCamarillaLock(){
   }
 
   if(!narrowCamarillaLockDone && minutes >= NARROW_CAMARILLA_LOCK_TIME_MINUTES){
-    const payload = trendScannerAvailable ? trendScanner.getNarrowCamarillaPayload(state) : { rows: [] };
+    const payload = trendScannerAvailable ? trendScanner.getNarrowCamarillaPayload(getStockOnlyState()) : { rows: [] };
     narrowCamarillaLockedRows = payload.rows;
     narrowCamarillaLockDone = true;
     narrowCamarillaLockTimestamp = timeLabel();
@@ -536,7 +553,7 @@ function checkAndRunScreenerScan(){
 
 function computeScreenersUnrestricted() {
   const openEqLow = [], openEqHigh = [], gapNeutral = [], openEqHighSimple = [], openEqLowYestLow = [], openEqLowSimple = [];
-  Object.keys(state).forEach(symbol => {
+  Object.keys(getStockOnlyState()).forEach(symbol => {
     const s = state[symbol];
     if (s.open === null || s.high === null || s.low === null) return;
 
@@ -660,7 +677,7 @@ function checkAndRunScreenerScan15m(){
 
 function computeScreener15mUnrestricted() {
   const openEqLow = [], openEqHigh = [], openEqHighSimple = [], openEqLowYestLow = [], openEqLowSimple = [];
-  Object.keys(state).forEach(symbol => {
+  Object.keys(getStockOnlyState()).forEach(symbol => {
     const s = state[symbol];
     if (s.open === null || s.high === null || s.low === null) return;
 
@@ -755,7 +772,7 @@ function checkAndLockTop3Losers916(){
     top3Losers916Locked = null;
   }
   if(!top3Losers916LockedFlag && minutes >= TOP3_LOSERS_916_LOCK_MINUTES){
-    const payload = trendScannerAvailable ? trendScanner.computeTop3LosersAt916(state) : { rows: [] };
+    const payload = trendScannerAvailable ? trendScanner.computeTop3LosersAt916(getStockOnlyState()) : { rows: [] };
     top3Losers916Locked = payload.rows;
     top3Losers916LockedFlag = true;
     const loser2 = top3Losers916Locked.find(r => r.rank === 2);
@@ -2655,7 +2672,7 @@ function checkAndLockOpeningRanges(){
   }
 
   if(!orb5LockedFlag && minutes >= (9*60+25)){
-    Object.keys(state).forEach(symbol => {
+    Object.keys(getStockOnlyState()).forEach(symbol => {
       const s = state[symbol];
       if(s.high !== null && s.low !== null) orb5Locked[symbol] = { high: s.high, low: s.low };
     });
@@ -2663,7 +2680,7 @@ function checkAndLockOpeningRanges(){
     console.log(`5-min Opening Range locked for ${Object.keys(orb5Locked).length} symbols.`);
   }
   if(!orb15LockedFlag && minutes >= (9*60+35)){
-    Object.keys(state).forEach(symbol => {
+    Object.keys(getStockOnlyState()).forEach(symbol => {
       const s = state[symbol];
       if(s.high !== null && s.low !== null) orb15Locked[symbol] = { high: s.high, low: s.low };
     });
@@ -3349,24 +3366,24 @@ function buildPayload(includeMultiStrike){
   // ONLY place getStrongWeakPayload() is called per broadcast, so it's the
   // natural spot to also check for new Strong/Weak/Turning-Weak qualifications
   const strongWeakPayload = trendScannerAvailable
-    ? trendScanner.getStrongWeakPayload(state)
+    ? trendScanner.getStrongWeakPayload(getStockOnlyState())
     : { strong: [], weak: [], turningWeak: [], all: [] };
   checkAndSendStrongWeakNotifications();
 
   const momentumScannerPayload = trendScannerAvailable
-    ? trendScanner.getMomentumScannerPayload(state, momentumScannerSymbols)
+    ? trendScanner.getMomentumScannerPayload(getStockOnlyState(), momentumScannerSymbols)
     : { matches: [] };
 
   const btstLivePayload = trendScannerAvailable
-    ? trendScanner.getBtstVolumeRatioPayload(state)
+    ? trendScanner.getBtstVolumeRatioPayload(getStockOnlyState())
     : { rows: [] };
 
   const narrowCprLivePayload = trendScannerAvailable
-    ? trendScanner.getNarrowCprPayload(state)
+    ? trendScanner.getNarrowCprPayload(getStockOnlyState())
     : { rows: [] };
 
   const narrowCamarillaLivePayload = trendScannerAvailable
-    ? trendScanner.getNarrowCamarillaPayload(state)
+    ? trendScanner.getNarrowCamarillaPayload(getStockOnlyState())
     : { rows: [] };
 
   return {
@@ -3402,7 +3419,7 @@ function buildPayload(includeMultiStrike){
     multiStrikeHalfDayLevels: includeMultiStrike ? buildMultiStrikeHalfDayLevels() : buildEmptyMultiStrikeHalfDayLevels(),
     trackedStrike: trackedStrikeSymbols,
     trackedStrikeDepth,
-    trendScanner: trendScannerAvailable ? trendScanner.getScannerPayload(state) : [],
+    trendScanner: trendScannerAvailable ? trendScanner.getScannerPayload(getStockOnlyState()) : [],
     strongWeakScanner: strongWeakPayload,
     momentumScanner: momentumScannerPayload,
     btstScanner: {
