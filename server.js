@@ -3253,7 +3253,13 @@ const server = http.createServer(async (req, res) => {
   res.end('Not found');
 });
 
-const wss = new WebSocket.Server({ server, path: '/live' });
+// 2026-08-28: no longer restricted to a single hardcoded path - accepts
+// both /live (reduced payload, no option-strike data) and /live-full
+// (the ISP pages' full payload, including the ~246-symbol option-strike
+// tracking). Path validated explicitly in the connection handler below,
+// since removing the `path` option here means this now accepts any path
+// reaching this server and must self-police which ones are legitimate.
+const wss = new WebSocket.Server({ server });
 
 function buildHalfDayLevels(){
   const result = {};
@@ -3323,7 +3329,18 @@ function buildMultiStrikeHalfDayLevels(){
   return result;
 }
 
-function buildPayload(){
+// 2026-08-28: cheap placeholder sent to clients that don't need option-
+// strike data at all (every screener page except the 5 ISP-related ones).
+// Same shape as buildMultiStrikeHalfDayLevels()'s return value so any
+// shared frontend code referencing payload.multiStrikeHalfDayLevels.NIFTY
+// etc still gets a valid (just empty) structure, never null/undefined -
+// but skips the ~246-symbol iteration and candle-history lookups entirely,
+// which is the actual expensive part.
+function buildEmptyMultiStrikeHalfDayLevels(){
+  return { NIFTY: [], BANKNIFTY: [], SENSEX: [] };
+}
+
+function buildPayload(includeMultiStrike){
   const orb5 = computeOrbBreakouts(5);
   const orb15 = computeOrbBreakouts(15);
 
@@ -3375,7 +3392,14 @@ function buildPayload(){
     first5MinLocked, first5MinLockedFlag,
     preMarketClose, preMarketCloseLockedFlag,
     halfDayLevels: buildHalfDayLevels(),
-    multiStrikeHalfDayLevels: buildMultiStrikeHalfDayLevels(),
+    // 2026-08-28: only computed/included when a client on one of the ISP
+    // pages is actually connected - this is the expensive part (iterates
+    // ~246 live-tracked option-strike symbols, building candle history for
+    // each). Every other screener page never needed this at all; it was
+    // being sent to them unconditionally on every broadcast. See
+    // buildEmptyMultiStrikeHalfDayLevels() for the cheap placeholder sent
+    // to clients that don't need it.
+    multiStrikeHalfDayLevels: includeMultiStrike ? buildMultiStrikeHalfDayLevels() : buildEmptyMultiStrikeHalfDayLevels(),
     trackedStrike: trackedStrikeSymbols,
     trackedStrikeDepth,
     trendScanner: trendScannerAvailable ? trendScanner.getScannerPayload(state) : [],
@@ -3465,14 +3489,40 @@ wss.on('connection', (ws, req) => {
     ws.close(4001, 'Invalid token');
     return;
   }
-  console.log('Browser tool connected to relay.');
-  ws.send(JSON.stringify(buildPayload()));
+  // 2026-08-28: /live-full is for the 5 ISP-related pages only (Nifty,
+  // ISP Selector, Nifty/BankNifty/Sensex ISP) - they get the full payload
+  // including live option-strike tracking. Every other path (including
+  // the original /live, still the default for every existing screener
+  // page's saved relay address) gets the reduced payload. Anything that
+  // isn't one of these two recognized paths is rejected outright, since
+  // this WebSocket.Server no longer restricts by path itself.
+  if (parsed.pathname === '/live-full') {
+    ws.wantsFullPayload = true;
+  } else if (parsed.pathname === '/live') {
+    ws.wantsFullPayload = false;
+  } else {
+    ws.close(4004, 'Unrecognized path');
+    return;
+  }
+  console.log(`Browser tool connected to relay (${ws.wantsFullPayload ? 'full' : 'reduced'} payload).`);
+  ws.send(JSON.stringify(buildPayload(ws.wantsFullPayload)));
 });
 
 function broadcastScreeners() {
-  const payload = JSON.stringify(buildPayload());
+  // Only pay the cost of computing the full (option-strike-inclusive)
+  // payload if at least one currently-connected client actually wants it -
+  // no point building it when no ISP page is open right now.
+  let anyWantsFull = false;
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(payload);
+    if (client.readyState === WebSocket.OPEN && client.wantsFullPayload) anyWantsFull = true;
+  });
+
+  const reducedPayload = JSON.stringify(buildPayload(false));
+  const fullPayload = anyWantsFull ? JSON.stringify(buildPayload(true)) : null;
+
+  wss.clients.forEach(client => {
+    if (client.readyState !== WebSocket.OPEN) return;
+    client.send(client.wantsFullPayload ? fullPayload : reducedPayload);
   });
 }
 
