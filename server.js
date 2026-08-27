@@ -805,6 +805,7 @@ function checkAndLockPreMarketClose(){
     } else {
       console.log(`Pre-market close: no symbol had live data by ${PRE_MARKET_CLOSE_HARD_CUTOFF_MINUTES/60|0}:${String(PRE_MARKET_CLOSE_HARD_CUTOFF_MINUTES%60).padStart(2,'0')} — giving up for today (likely a restart well after market open; discovery will fall back to live LTP instead, same as it already does).`);
     }
+    savePreMarketClose();
   }
   // else: keep retrying next cycle - the connection may still be establishing
 }
@@ -1518,6 +1519,7 @@ function checkAndLockFirstHalf(){
       } else {
         console.log(`First-half (9:15-12:30): no symbol had live data by the hard cutoff — giving up for today (likely a restart well after this window).`);
       }
+      saveHalfDayLocked();
     }
     // else: keep retrying next cycle - the connection may still be establishing
   }
@@ -1567,6 +1569,7 @@ function checkAndLockSecondHalf(){
   } else {
     console.log(`Second-half (12:30-3:30): no symbol had live data by the hard cutoff — giving up for today (likely a restart well after this window).`);
   }
+  saveHalfDayLocked();
   HALF_DAY_SYMBOLS.forEach(symbol => {
     if(firstHalfLocked[symbol] || secondHalfLocked[symbol]){
       yesterdayHalves[symbol] = {
@@ -2159,6 +2162,20 @@ function loadFirst5MinLocked(){
     }
     first5MinLocked = saved.first5MinLocked;
     first5MinLockedFlag = saved.first5MinLockedFlag;
+    // 2026-08-28 bug fix: this line was missing entirely. Without it,
+    // first5MinDateKey stayed at its initial `null` value even after a
+    // successful restore - so the very next tick, checkAndLockFirst5MinCandle()
+    // saw first5MinDateKey (null) !== today's real date key, treated that
+    // mismatch as "a new day has started", and immediately WIPED the
+    // first5MinLocked/first5MinLockedFlag this function had just restored -
+    // right back to empty. Confirmed as the exact, direct cause of losing
+    // an already-locked first-5-min candle after a real crash-restart on
+    // 2026-08-27 (see server logs: the restore-success log line was
+    // immediately followed by a "no symbol had live data - giving up"
+    // line on the very next tick). loadScreenerScanResults() already got
+    // this right (sets screenerScanDateKey on restore) - this brings
+    // loadFirst5MinLocked() in line with that same, correct pattern.
+    first5MinDateKey = saved.date;
     console.log(`Restored today's first-5-min candle from disk (${Object.keys(first5MinLocked).length} symbols) — survived the restart/redeploy.`);
   } catch(err){
     console.log('Could not load persisted first-5-min lock (this is fine if no volume is mounted yet):', err.message);
@@ -2175,7 +2192,104 @@ function saveFirst5MinLocked(){
   }
 }
 
+// 2026-08-28: preMarketClose previously had NO persistence at all - a
+// crash-restart any time after it locked (which is most of the trading
+// day, since it locks by ~9:09-9:15 AM) permanently lost it for the rest
+// of the day, with no way to recover it (pre-market hours can't be
+// revisited). Confirmed as a real, direct cause of lost functionality
+// after an out-of-memory crash on 2026-08-27. Follows the same
+// save/load pattern as first5MinLocked above - including setting
+// preMarketCloseDateKey on restore, the exact line that was missing from
+// loadFirst5MinLocked() and caused that same "restored data gets
+// immediately wiped" bug, fixed alongside this.
+const PRE_MARKET_CLOSE_PERSIST_FILE = path.join(PERSIST_DIR, 'pre_market_close.json');
+
+function savePreMarketClose(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { date: todayDateKey(), preMarketClose, preMarketCloseLockedFlag };
+    fs.writeFileSync(PRE_MARKET_CLOSE_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save pre-market close to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+function loadPreMarketClose(){
+  try{
+    if(!fs.existsSync(PRE_MARKET_CLOSE_PERSIST_FILE)) {
+      console.log('No persisted pre-market close found — will capture fresh today around 9:09 AM.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(PRE_MARKET_CLOSE_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted pre-market close is from a previous day — will capture fresh today.');
+      return;
+    }
+    preMarketClose = saved.preMarketClose;
+    preMarketCloseLockedFlag = saved.preMarketCloseLockedFlag;
+    preMarketCloseDateKey = saved.date;
+    console.log(`Restored today's pre-market close from disk (${Object.keys(preMarketClose).length} symbols) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted pre-market close (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+// 2026-08-28: firstHalfLocked/secondHalfLocked (today's actual half-day
+// values, not the separate "yesterday" fallback snapshot) had the same
+// missing-persistence gap preMarketClose had - confirmed while
+// investigating the 2026-08-27 crash, though these specifically hadn't
+// locked yet at the moment that crash happened, so they weren't the
+// direct cause that day. Fixed now since a future crash after 12:30 PM
+// or 3:30 PM could lose them the same way - and downstream tools
+// (Narrow CPR Next-Day Screener, BTST) depend on this data being
+// available the next trading day via the yesterday-rollover logic above,
+// which itself depends on firstHalfLocked/secondHalfLocked being correct
+// at end of day. Also persists secondHalfOpen/secondHalfRunning, since
+// checkAndLockSecondHalf() needs those mid-day even if a restart happens
+// between the two lock times.
+const HALF_DAY_LOCKED_PERSIST_FILE = path.join(PERSIST_DIR, 'half_day_locked.json');
+
+function saveHalfDayLocked(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = {
+      date: todayDateKey(),
+      firstHalfLocked, secondHalfLocked, firstHalfLockedFlag, secondHalfLockedFlag,
+      secondHalfOpen, secondHalfRunning,
+    };
+    fs.writeFileSync(HALF_DAY_LOCKED_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save half-day locked state to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+function loadHalfDayLocked(){
+  try{
+    if(!fs.existsSync(HALF_DAY_LOCKED_PERSIST_FILE)) {
+      console.log('No persisted half-day locked state found — will lock fresh today at 12:30 PM / 3:30 PM.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(HALF_DAY_LOCKED_PERSIST_FILE, 'utf8'));
+    if(saved.date !== todayDateKey()){
+      console.log('Persisted half-day locked state is from a previous day — will lock fresh today.');
+      return;
+    }
+    firstHalfLocked = saved.firstHalfLocked;
+    secondHalfLocked = saved.secondHalfLocked;
+    firstHalfLockedFlag = saved.firstHalfLockedFlag;
+    secondHalfLockedFlag = saved.secondHalfLockedFlag;
+    secondHalfOpen = saved.secondHalfOpen || {};
+    secondHalfRunning = saved.secondHalfRunning || {};
+    halfDayDateKey = saved.date;
+    console.log(`Restored today's half-day locked state from disk (first-half: ${firstHalfLockedFlag ? Object.keys(firstHalfLocked).length + ' symbols' : 'not yet locked'}, second-half: ${secondHalfLockedFlag ? Object.keys(secondHalfLocked).length + ' symbols' : 'not yet locked'}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted half-day locked state (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
 loadFirst5MinLocked();
+loadPreMarketClose();
+loadHalfDayLocked();
 
 function loadScreenerScanResults(){
   try{
