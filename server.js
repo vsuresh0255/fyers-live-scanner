@@ -1035,6 +1035,89 @@ async function fetchAndParseTodaysBhavcopy(){
   return parsed.data; // raw rows, matching nseRows/nseFutRows shape exactly (new UDiFF format combines both)
 }
 
+// ============================================================
+// Automatic BSE (Sensex) bhavcopy fetching — 2026-08-28
+// =====================================================================
+// URL confirmed via multiple independent, real example URLs found on
+// bseindia.com's own domain (two different dates both matching this exact
+// pattern), plus BSE's own official "UDiFF BhavCopy Format" documentation
+// page - and further confirmed by the user's own already-downloaded
+// BSE_FO_bhavcopy files matching the exact expected UDiFF column
+// structure (same TradDt/TckrSymb/StrkPric/OptnTp columns as NSE's
+// format, since it's the same SEBI-mandated format across exchanges).
+// Not independently test-downloaded live the way the NSE URL was, so
+// slightly less certain than that one - worth confirming the first real
+// auto-fetch actually succeeds. Unlike NSE's bhavcopy, this is a raw
+// (uppercase) .CSV file, not zipped - no AdmZip step needed. BSE is a
+// different domain than NSE, so the NSE-specific session-cookie warmup
+// doesn't apply here; a realistic User-Agent is included as a reasonable
+// precaution anyway.
+// ============================================================
+function buildBseFoBhavcopyUrl(dateObj){
+  const pad = n => String(n).padStart(2, '0');
+  const yyyy = dateObj.getFullYear();
+  const mm = pad(dateObj.getMonth() + 1);
+  const dd = pad(dateObj.getDate());
+  return `https://www.bseindia.com/download/Bhavcopy/Derivative/BhavCopy_BSE_FO_0_0_0_${yyyy}${mm}${dd}_F_0000.CSV`;
+}
+
+async function fetchAndParseTodaysBseBhavcopy(){
+  const now = new Date();
+  const url = buildBseFoBhavcopyUrl(now);
+  const headers = { 'User-Agent': NSE_USER_AGENT };
+
+  const csvText = await fetchUrl(url, 15000, headers);
+
+  // exact same parse config as NSE's bhavcopy and the Setup page's own upload
+  const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true, transformHeader: h => h.replace(/^\uFEFF/, '').trim() });
+  if(!parsed.data || parsed.data.length === 0){
+    throw new Error('Parsed BSE bhavcopy CSV has zero rows - something is wrong with the downloaded file');
+  }
+  return parsed.data;
+}
+
+let bseBhavcopyData = { bseRows: null, bseRowsPrev: null, fetchedAt: null, fetchDateKey: null };
+let bseBhavcopyFetchDoneToday = false;
+let bseBhavcopyFetchDateKey = null;
+let bseBhavcopyLastAttemptAt = 0;
+
+async function checkAndFetchBseBhavcopy(){
+  const { dateKey, minutes } = getISTDateKeyAndMinutes();
+
+  if(bseBhavcopyFetchDateKey !== dateKey){
+    bseBhavcopyFetchDateKey = dateKey;
+    bseBhavcopyFetchDoneToday = false;
+  }
+
+  if(bseBhavcopyFetchDoneToday || minutes < BHAVCOPY_FETCH_START_MINUTES) return;
+
+  const nowMs = Date.now();
+  if(nowMs - bseBhavcopyLastAttemptAt < BHAVCOPY_RETRY_INTERVAL_MS) return;
+  bseBhavcopyLastAttemptAt = nowMs;
+
+  try{
+    const rows = await fetchAndParseTodaysBseBhavcopy();
+    const prevRows = bseBhavcopyData.bseRows;
+
+    bseBhavcopyData = {
+      bseRows: rows,
+      bseRowsPrev: prevRows,
+      fetchedAt: new Date().toISOString(),
+      fetchDateKey: dateKey,
+    };
+    bseBhavcopyFetchDoneToday = true;
+    console.log(`BSE bhavcopy auto-fetched successfully: ${rows.length} rows for ${dateKey}.`);
+    saveBseBhavcopyData();
+  } catch(err){
+    if(minutes >= BHAVCOPY_FETCH_HARD_CUTOFF_MINUTES){
+      bseBhavcopyFetchDoneToday = true;
+      console.log(`BSE bhavcopy auto-fetch: giving up for today after repeated failures past the hard cutoff. Last error: ${err.message}`);
+    } else {
+      console.log(`BSE bhavcopy auto-fetch attempt failed (will retry in ${BHAVCOPY_RETRY_INTERVAL_MS/60000} min): ${err.message}`);
+    }
+  }
+}
+
 async function checkAndFetchBhavcopy(){
   const { dateKey, minutes } = getISTDateKeyAndMinutes();
 
@@ -1076,6 +1159,7 @@ async function checkAndFetchBhavcopy(){
     }
   }
 }
+
 
 // ============================================================
 // Automatic delivery-data (sec_bhavdata_full) fetching — 2026-08-24
@@ -2099,6 +2183,36 @@ function saveBhavcopyData(){
 
 loadBhavcopyData();
 
+const BSE_BHAVCOPY_PERSIST_FILE = path.join(PERSIST_DIR, 'bse_bhavcopy_data.json');
+
+function loadBseBhavcopyData(){
+  try{
+    if(!fs.existsSync(BSE_BHAVCOPY_PERSIST_FILE)) {
+      console.log('No persisted BSE bhavcopy data found — will auto-fetch fresh starting at 4:15 PM today.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(BSE_BHAVCOPY_PERSIST_FILE, 'utf8'));
+    bseBhavcopyData = saved.bseBhavcopyData || bseBhavcopyData;
+    bseBhavcopyFetchDoneToday = saved.fetchDateKey === todayDateKey();
+    bseBhavcopyFetchDateKey = saved.fetchDateKey || null;
+    console.log(`Restored BSE bhavcopy data from disk (last fetched: ${bseBhavcopyData.fetchedAt || 'never'}, for ${bseBhavcopyData.fetchDateKey || 'n/a'}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted BSE bhavcopy data (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveBseBhavcopyData(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    const toSave = { bseBhavcopyData, fetchDateKey: bseBhavcopyFetchDateKey };
+    fs.writeFileSync(BSE_BHAVCOPY_PERSIST_FILE, JSON.stringify(toSave));
+  } catch(err){
+    console.log('Could not save BSE bhavcopy data to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+loadBseBhavcopyData();
+
 const DELIVERY_MAP_PERSIST_FILE = path.join(PERSIST_DIR, 'delivery_map_data.json');
 
 function loadDeliveryMapData(){
@@ -2712,6 +2826,7 @@ function recordMinuteSlot(){
   checkAndRunNarrowCamarillaLock();
   checkAndLockTop3Losers916();
   checkAndFetchBhavcopy();
+  checkAndFetchBseBhavcopy();
   checkAndFetchDeliveryData();
   checkAndFetchVolatilityData();
   checkAndLockFirst5MinCandle();
@@ -3266,6 +3381,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/bse-bhavcopy-data' && req.method === 'GET') {
+    // Same on-demand pattern as /bhavcopy-data above, for BSE (Sensex)
+    // bhavcopy specifically - smaller (~780 rows vs NSE's ~36,000) but
+    // still kept off the regular per-second broadcast rather than assumed
+    // "small enough to just include directly".
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(bseBhavcopyData));
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -3494,6 +3619,12 @@ function buildPayload(includeMultiStrike){
       fetchDateKey: bhavcopyData.fetchDateKey,
       rowCount: bhavcopyData.nseRows ? bhavcopyData.nseRows.length : 0,
       prevRowCount: bhavcopyData.nseRowsPrev ? bhavcopyData.nseRowsPrev.length : 0,
+    },
+    bseBhavcopyMeta: {
+      fetchedAt: bseBhavcopyData.fetchedAt,
+      fetchDateKey: bseBhavcopyData.fetchDateKey,
+      rowCount: bseBhavcopyData.bseRows ? bseBhavcopyData.bseRows.length : 0,
+      prevRowCount: bseBhavcopyData.bseRowsPrev ? bseBhavcopyData.bseRowsPrev.length : 0,
     },
     // Unlike bhavcopy, deliveryMap is small (~200 symbols, not tens of
     // thousands of rows) - safe to include in full on every broadcast
