@@ -1204,6 +1204,37 @@ async function checkAndFetchBhavcopy(){
 // directly rather than needing a separate on-demand endpoint like bhavcopy.
 // ============================================================
 let deliveryMapData = { deliveryMap: null, fetchedAt: null, fetchDateKey: null };
+
+// 2026-08-28: multi-day delivery% history, for the BTST screener - it
+// currently requires manually uploading a hand-combined
+// delivery_data_combined.csv (confirmed by reading that page's own code:
+// averageRecentDeliveryPct() needs DELIVERY_LOOKBACK_DAYS=4 days of
+// history per symbol, stored client-side in IndexedDB via a separate
+// manual-upload widget). Shape matches exactly what that page already
+// expects (symbol -> date -> delivPer as a plain number) so it could
+// consume this directly with zero reshaping if pointed at it. Reuses
+// BHAVCOPY_HISTORY_DAYS (7) for buffer beyond the 4 actually needed.
+// Dates tracked once, shared across all ~2000+ EQ symbols, since they're
+// all updated together from the same daily fetch - avoids re-sorting
+// per-symbol date lists on every trim.
+let deliveryPctHistory = {}; // symbol -> date -> delivPer
+let deliveryHistoryDates = []; // sorted, shared across all symbols
+
+function addDeliveryToHistoryAndTrim(deliveryMap, dateKey){
+  Object.keys(deliveryMap).forEach(symbol => {
+    if(!deliveryPctHistory[symbol]) deliveryPctHistory[symbol] = {};
+    deliveryPctHistory[symbol][dateKey] = deliveryMap[symbol].delivPer;
+  });
+  if(!deliveryHistoryDates.includes(dateKey)) deliveryHistoryDates.push(dateKey);
+  deliveryHistoryDates.sort();
+  while(deliveryHistoryDates.length > BHAVCOPY_HISTORY_DAYS){
+    const oldest = deliveryHistoryDates.shift();
+    Object.keys(deliveryPctHistory).forEach(symbol => {
+      delete deliveryPctHistory[symbol][oldest];
+    });
+  }
+}
+
 let deliveryFetchDoneToday = false;
 let deliveryFetchDateKey = null;
 let deliveryLastAttemptAt = 0;
@@ -1275,6 +1306,8 @@ async function checkAndFetchDeliveryData(){
     deliveryFetchDoneToday = true;
     console.log(`Delivery data auto-fetched successfully: ${Object.keys(deliveryMap).length} symbols for ${dateKey}.`);
     saveDeliveryMapData();
+    addDeliveryToHistoryAndTrim(deliveryMap, dateKey);
+    saveDeliveryPctHistory();
   } catch(err){
     if(minutes >= BHAVCOPY_FETCH_HARD_CUTOFF_MINUTES){
       deliveryFetchDoneToday = true;
@@ -2320,6 +2353,34 @@ function saveDeliveryMapData(){
 }
 
 loadDeliveryMapData();
+
+const DELIVERY_HISTORY_PERSIST_FILE = path.join(PERSIST_DIR, 'delivery_pct_history.json');
+
+function saveDeliveryPctHistory(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    fs.writeFileSync(DELIVERY_HISTORY_PERSIST_FILE, JSON.stringify({ deliveryPctHistory, deliveryHistoryDates }));
+  } catch(err){
+    console.log('Could not save delivery% history to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+function loadDeliveryPctHistory(){
+  try{
+    if(!fs.existsSync(DELIVERY_HISTORY_PERSIST_FILE)) {
+      console.log('No persisted delivery% history found — will build up fresh as each day auto-fetches.');
+      return;
+    }
+    const saved = JSON.parse(fs.readFileSync(DELIVERY_HISTORY_PERSIST_FILE, 'utf8'));
+    deliveryPctHistory = saved.deliveryPctHistory || {};
+    deliveryHistoryDates = saved.deliveryHistoryDates || [];
+    console.log(`Restored delivery% history from disk (${deliveryHistoryDates.length} day(s): ${deliveryHistoryDates.join(', ')}, ${Object.keys(deliveryPctHistory).length} symbols) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted delivery% history (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+loadDeliveryPctHistory();
 
 const VOLATILITY_MAP_PERSIST_FILE = path.join(PERSIST_DIR, 'volatility_map_data.json');
 
@@ -3484,6 +3545,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/delivery-history' && req.method === 'GET') {
+    // Multi-day delivery% history for BTST - shape already matches
+    // deliveryPctData's own expected format (symbol -> date -> delivPer),
+    // so this can be consumed directly with no reshaping.
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(deliveryPctHistory));
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -3725,6 +3795,10 @@ function buildPayload(includeMultiStrike){
     bhavcopyHistoryMeta: {
       nseAvailableDates: Object.keys(nseBhavcopyHistory).sort(),
       bseAvailableDates: Object.keys(bseBhavcopyHistory).sort(),
+    },
+    deliveryHistoryMeta: {
+      availableDates: deliveryHistoryDates,
+      symbolCount: Object.keys(deliveryPctHistory).length,
     },
     // Unlike bhavcopy, deliveryMap is small (~200 symbols, not tens of
     // thousands of rows) - safe to include in full on every broadcast
