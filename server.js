@@ -969,6 +969,30 @@ const BHAVCOPY_RETRY_INTERVAL_MS = 5 * 60 * 1000; // retry every 5 minutes while
 const NSE_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 let bhavcopyData = { nseRows: null, nseFutRows: null, nseRowsPrev: null, nseFutRowsPrev: null, fetchedAt: null, fetchDateKey: null };
+
+// 2026-08-28: rolling 7-day bhavcopy history, both exchanges - specifically
+// for the NR4/NR7 screener, which currently requires manually uploading N
+// consecutive days' futures bhavcopy files by hand every time it's run
+// (confirmed by reading that page's own code). Kept off the regular
+// per-second broadcast entirely, same discipline as bhavcopyData itself -
+// only the date list goes in the broadcast (bhavcopyHistoryMeta below),
+// the actual row data is served on-demand via /bhavcopy-history and
+// /bse-bhavcopy-history. RAM cost is real but small relative to Railway's
+// actual per-GB pricing (confirmed cheap from the user's own cost
+// breakdown - RAM was $0.41 for 1780 GB-hours in that period).
+const BHAVCOPY_HISTORY_DAYS = 7;
+let nseBhavcopyHistory = {}; // { 'YYYY-MM-DD': rows[] }
+let bseBhavcopyHistory = {};
+
+function addToHistoryAndTrim(historyObj, dateKey, rows){
+  historyObj[dateKey] = rows;
+  const dates = Object.keys(historyObj).sort(); // ISO date strings sort correctly as plain strings
+  while(dates.length > BHAVCOPY_HISTORY_DAYS){
+    const oldest = dates.shift();
+    delete historyObj[oldest];
+  }
+}
+
 let bhavcopyFetchDoneToday = false;
 let bhavcopyFetchDateKey = null;
 let bhavcopyLastAttemptAt = 0;
@@ -1108,6 +1132,8 @@ async function checkAndFetchBseBhavcopy(){
     bseBhavcopyFetchDoneToday = true;
     console.log(`BSE bhavcopy auto-fetched successfully: ${rows.length} rows for ${dateKey}.`);
     saveBseBhavcopyData();
+    addToHistoryAndTrim(bseBhavcopyHistory, dateKey, rows);
+    saveBseBhavcopyHistory();
   } catch(err){
     if(minutes >= BHAVCOPY_FETCH_HARD_CUTOFF_MINUTES){
       bseBhavcopyFetchDoneToday = true;
@@ -1150,6 +1176,8 @@ async function checkAndFetchBhavcopy(){
     bhavcopyFetchDoneToday = true;
     console.log(`Bhavcopy auto-fetched successfully: ${rows.length} rows for ${dateKey}.${prevRows ? ` Previous day rolled forward (${prevRows.length} rows).` : ' No previous day data available yet (first run).'}`);
     saveBhavcopyData();
+    addToHistoryAndTrim(nseBhavcopyHistory, dateKey, rows);
+    saveNseBhavcopyHistory();
   } catch(err){
     if(minutes >= BHAVCOPY_FETCH_HARD_CUTOFF_MINUTES){
       bhavcopyFetchDoneToday = true; // give up for today - stop retrying, NSE likely isn't publishing today (holiday, etc.)
@@ -2212,6 +2240,56 @@ function saveBseBhavcopyData(){
 }
 
 loadBseBhavcopyData();
+
+const NSE_BHAVCOPY_HISTORY_FILE = path.join(PERSIST_DIR, 'nse_bhavcopy_history.json');
+const BSE_BHAVCOPY_HISTORY_FILE = path.join(PERSIST_DIR, 'bse_bhavcopy_history.json');
+
+function saveNseBhavcopyHistory(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    fs.writeFileSync(NSE_BHAVCOPY_HISTORY_FILE, JSON.stringify(nseBhavcopyHistory));
+  } catch(err){
+    console.log('Could not save NSE bhavcopy history to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+function loadNseBhavcopyHistory(){
+  try{
+    if(!fs.existsSync(NSE_BHAVCOPY_HISTORY_FILE)) {
+      console.log('No persisted NSE bhavcopy history found — will build up fresh as each day auto-fetches.');
+      return;
+    }
+    nseBhavcopyHistory = JSON.parse(fs.readFileSync(NSE_BHAVCOPY_HISTORY_FILE, 'utf8'));
+    console.log(`Restored NSE bhavcopy history from disk (${Object.keys(nseBhavcopyHistory).length} day(s): ${Object.keys(nseBhavcopyHistory).sort().join(', ')}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted NSE bhavcopy history (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+function saveBseBhavcopyHistory(){
+  try{
+    if(!fs.existsSync(PERSIST_DIR)) return;
+    fs.writeFileSync(BSE_BHAVCOPY_HISTORY_FILE, JSON.stringify(bseBhavcopyHistory));
+  } catch(err){
+    console.log('Could not save BSE bhavcopy history to disk (this is fine if no volume is mounted):', err.message);
+  }
+}
+
+function loadBseBhavcopyHistory(){
+  try{
+    if(!fs.existsSync(BSE_BHAVCOPY_HISTORY_FILE)) {
+      console.log('No persisted BSE bhavcopy history found — will build up fresh as each day auto-fetches.');
+      return;
+    }
+    bseBhavcopyHistory = JSON.parse(fs.readFileSync(BSE_BHAVCOPY_HISTORY_FILE, 'utf8'));
+    console.log(`Restored BSE bhavcopy history from disk (${Object.keys(bseBhavcopyHistory).length} day(s): ${Object.keys(bseBhavcopyHistory).sort().join(', ')}) — survived the restart/redeploy.`);
+  } catch(err){
+    console.log('Could not load persisted BSE bhavcopy history (this is fine if no volume is mounted yet):', err.message);
+  }
+}
+
+loadNseBhavcopyHistory();
+loadBseBhavcopyHistory();
 
 const DELIVERY_MAP_PERSIST_FILE = path.join(PERSIST_DIR, 'delivery_map_data.json');
 
@@ -3391,6 +3469,21 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (parsed.pathname === '/bhavcopy-history' && req.method === 'GET') {
+    // Rolling 7-day NSE bhavcopy history, for the NR4/NR7 screener - see
+    // bhavcopyHistoryMeta in the regular broadcast for the list of
+    // available dates without needing to fetch this full endpoint first.
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(nseBhavcopyHistory));
+    return;
+  }
+
+  if (parsed.pathname === '/bse-bhavcopy-history' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(bseBhavcopyHistory));
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -3625,6 +3718,13 @@ function buildPayload(includeMultiStrike){
       fetchDateKey: bseBhavcopyData.fetchDateKey,
       rowCount: bseBhavcopyData.bseRows ? bseBhavcopyData.bseRows.length : 0,
       prevRowCount: bseBhavcopyData.bseRowsPrev ? bseBhavcopyData.bseRowsPrev.length : 0,
+    },
+    // 2026-08-28: date lists only - tells a page whether the 7-day
+    // history has what it needs before deciding to fetch the full
+    // /bhavcopy-history or /bse-bhavcopy-history endpoint at all.
+    bhavcopyHistoryMeta: {
+      nseAvailableDates: Object.keys(nseBhavcopyHistory).sort(),
+      bseAvailableDates: Object.keys(bseBhavcopyHistory).sort(),
     },
     // Unlike bhavcopy, deliveryMap is small (~200 symbols, not tens of
     // thousands of rows) - safe to include in full on every broadcast
