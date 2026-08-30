@@ -177,13 +177,26 @@ symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null
 // forms need excluding here. Used by every screener page EXCEPT the 5
 // ISP-related ones, which still work from the full `state` object
 // directly and are unaffected by this. Rebuilt fresh on every call since
-// `state` itself changes constantly - cheap, since it's just excluding 6
-// keys from a ~213-entry object, not deep-cloning anything.
+// `state` itself changes constantly - cheap, since it's just excluding a
+// couple hundred keys from a ~450-entry object, not deep-cloning anything.
+//
+// 2026-08-29 bug fix: this originally only excluded the 3 bare indices
+// and their real Fyers symbols - it never excluded the ~200+ individual
+// OPTION STRIKE symbols (e.g. "NSE:NIFTY2690123400CE") subscribed via the
+// multi-strike ATM discovery for the ISP Selector feature. Those are also
+// stored in `state` like any other symbol, so they were still leaking
+// into every general screener's results - confirmed directly from
+// screenshots showing NIFTY/BANKNIFTY option strikes appearing in the
+// Narrow CPR and Open=Low screeners. multiStrikeSymbolList already tracks
+// exactly this set of symbols; excluding it here closes the gap.
 const INDEX_STATE_KEYS = ['NSE:NIFTY50-INDEX', 'NSE:NIFTYBANK-INDEX', 'BSE:SENSEX-INDEX', 'NIFTY', 'BANKNIFTY', 'SENSEX'];
 function getStockOnlyState(){
   const filtered = {};
+  const optionStrikeSymbols = new Set(multiStrikeSymbolList);
   Object.keys(state).forEach(key => {
-    if(!INDEX_STATE_KEYS.includes(key)) filtered[key] = state[key];
+    if(INDEX_STATE_KEYS.includes(key)) return;
+    if(optionStrikeSymbols.has(key)) return;
+    filtered[key] = state[key];
   });
   return filtered;
 }
@@ -856,7 +869,15 @@ let firstHalfLockedFlag = false;
 let secondHalfLockedFlag = false;
 
 const STRIKE_INTERVALS = { NIFTY: 50, BANKNIFTY: 100, SENSEX: 100 };
-const STRIKE_TRACK_RANGE = 20; // was 10, originally 5 — widened further since the server's ATM anchor still can't know what price a user manually enters on the ISP Selector page (that entry is client-side only, never sent back here) — this is the honest, reliable safety net regardless of whether pre-market ticks stream that day
+// 2026-08-29: reduced from 20 back to 10, per explicit request to cut
+// option-strike tracking cost. Was widened to 20 specifically because the
+// server's ATM anchor can't know what price a user manually enters on the
+// ISP Selector's Manual ISP Entry panel (that entry is client-side only,
+// never sent back here) - at +/-10, a manually-entered ISP value far
+// enough from the server's own anchor could fall outside the tracked
+// range and show "no live data" for those strikes. Accepted trade-off,
+// not a bug - narrower range was the explicit ask.
+const STRIKE_TRACK_RANGE = 10;
 const NSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/NSE_FO.csv';
 const BSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/BSE_FO.csv';
 
