@@ -1058,7 +1058,30 @@ async function fetchAndParseTodaysBhavcopy(){
   const headers = { 'User-Agent': NSE_USER_AGENT };
   if(cookie) headers['Cookie'] = cookie;
 
-  const zipBuffer = await fetchUrlBinary(url, headers);
+  // 2026-09-01: switched from fetchUrlBinary (which drains and discards
+  // the response body on any non-200 status) to fetchWithHeaders, which
+  // captures the full response regardless of status. This URL has now
+  // 404'd consistently, every single retry, across two separate real
+  // trading days (confirmed from logs, not a weekend/holiday
+  // coincidence) - a bare "HTTP 404" was all we had to go on, with zero
+  // visibility into whether NSE's actual response body explains why
+  // (bot-detection challenge page vs a genuine missing-file page vs
+  // something else). Logging the real diagnostic now so the next
+  // failure gives an actual, actionable answer instead of another round
+  // of guessing.
+  const resp = await fetchWithHeaders(url, headers, 30000);
+  if(resp.statusCode !== 200){
+    const bodySnippet = resp.body.toString('utf8', 0, 500).replace(/\s+/g, ' ').trim();
+    const diagnosticHeaders = {
+      server: resp.headers['server'],
+      'content-type': resp.headers['content-type'],
+      'cf-ray': resp.headers['cf-ray'], // present only if Cloudflare intercepted the request - a strong signal of bot-detection rather than a genuine "file missing" 404
+      'x-cache': resp.headers['x-cache'],
+    };
+    console.log(`Bhavcopy fetch diagnostic — status ${resp.statusCode}, headers: ${JSON.stringify(diagnosticHeaders)}, body starts: "${bodySnippet}"`);
+    throw new Error(`HTTP ${resp.statusCode} fetching ${url}`);
+  }
+  const zipBuffer = resp.body;
 
   const zip = new AdmZip(zipBuffer);
   const entries = zip.getEntries();
