@@ -157,6 +157,24 @@ if (fs.existsSync(MARKET_CAP_SYMBOLS_PATH)) {
 // ============ live state per symbol ============
 const state = {};
 symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null }; });
+
+// 2026-09-01: sectoral indices, resolved asynchronously against Fyers'
+// own NSE_CM.csv symbol master (see resolveSectoralIndexSymbols) rather
+// than a hardcoded, guessed symbol list. label -> Fyers symbol, populated
+// once resolution completes below. Context/display only, not subscribed
+// or used anywhere else - separate from `symbols`/`state`'s main tick
+// pipeline conceptually, though it reuses that same pipeline mechanically
+// (added to `symbols` and `state` once resolved, so the existing tick
+// handler picks them up with no separate code path needed).
+//
+// The actual resolveSectoralIndexSymbols() call is further down in this
+// file (right after its dependencies - SECTORAL_INDICES, the CSV master
+// URL - are defined), not here, to avoid a temporal-dead-zone error:
+// this variable declaration needs to exist early since `state`/`symbols`
+// get modified once resolution completes, but the call itself can't run
+// until its dependencies are actually declared.
+let sectoralIndexSymbols = {};
+
 // The 210 stocks use their own Fyers symbol as both the subscribe symbol
 // AND the state key, so the loop above is sufficient for them. The three
 // indices are different: symbols.json now (correctly) holds their real
@@ -881,6 +899,61 @@ const STRIKE_TRACK_RANGE = 10;
 const NSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/NSE_FO.csv';
 const BSE_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/BSE_FO.csv';
 
+// 2026-09-01: sectoral indices, for context/display only - no options
+// tracking (most of these don't even have listed options on NSE at all;
+// confirmed directly against NSE's own Option Chain page, which only
+// lists NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/NIFTYNXT50). This is the
+// complete, official list from NSE's own "Sectoral Indices" page
+// (nseindia.com/static/products-services/indices-sectoral, checked
+// 2026-09-01) - 34 total, including Bank which is already tracked
+// separately as BANKNIFTY and is skipped here to avoid a duplicate.
+//
+// Exact Fyers symbol codes for the less common ones aren't something I
+// could verify directly (public.fyers.in blocks automated fetches from
+// my side) - instead of guessing ~20 of these blind, the server looks
+// each one up BY NAME against Fyers' own NSE_CM.csv symbol master at
+// startup (see resolveSectoralIndexSymbols below), the same way it
+// already looks up option strikes from NSE_FO.csv. include/exclude
+// keywords disambiguate names that would otherwise overlap (e.g.
+// "Financial Services" alone would also match "Financial Services
+// 25/50" and "Financial Services Ex-Bank").
+const SECTORAL_INDICES = [
+  { label: 'Nifty Auto',                    include: ['AUTO'],                                exclude: [] },
+  { label: 'Nifty Cement',                  include: ['CEMENT'],                              exclude: [] },
+  { label: 'Nifty Capital Goods',           include: ['CAPITAL', 'GOODS'],                    exclude: [] },
+  { label: 'Nifty Chemicals',               include: ['CHEMICAL'],                            exclude: [] },
+  { label: 'Nifty Commercial & Transport',  include: ['COMMERCIAL', 'TRANSPORT'],             exclude: [] },
+  { label: 'Nifty Construction',            include: ['CONSTRUCTION'],                        exclude: [] },
+  { label: 'Nifty Consumer Services',       include: ['CONSUMER', 'SERVICE'],                 exclude: ['DURABLE'] },
+  { label: 'Nifty Financial Services',      include: ['FINANCIAL', 'SERVICE'],                exclude: ['25/50', '2550', 'EX-BANK', 'EXBANK', 'EX BANK', 'MIDSMALL', 'MID SMALL'] },
+  { label: 'Nifty Financial Services 25/50',include: ['FINANCIAL', 'SERVICE'],                exclude: [], requireAny: ['25/50', '2550'] },
+  { label: 'Nifty Financial Services Ex-Bank', include: ['FINANCIAL', 'SERVICE'],              exclude: [], requireAny: ['EX-BANK', 'EXBANK', 'EX BANK'] },
+  { label: 'Nifty FMCG',                    include: ['FMCG'],                                exclude: [] },
+  { label: 'Nifty Healthcare',              include: ['HEALTHCARE'],                          exclude: ['500', 'MIDSMALL', 'MID SMALL'] },
+  { label: 'Nifty Hospitals',               include: ['HOSPITAL'],                            exclude: [] },
+  { label: 'Nifty Housing Finance',         include: ['HOUSING', 'FINANCE'],                  exclude: [] },
+  { label: 'Nifty Insurance',               include: ['INSURANCE'],                           exclude: [] },
+  { label: 'Nifty IT',                      include: ['IT'],                                  exclude: ['MIDSMALL', 'MID SMALL', 'TELECOM', 'SERVICES', 'EX'], wholeWord: true },
+  { label: 'Nifty Media',                   include: ['MEDIA'],                               exclude: [] },
+  { label: 'Nifty Metal',                   include: ['METAL'],                               exclude: [] },
+  { label: 'Nifty NBFC',                    include: ['NBFC'],                                exclude: [] },
+  { label: 'Nifty Pharma',                  include: ['PHARMA'],                              exclude: [] },
+  { label: 'Nifty Power',                   include: ['POWER'],                               exclude: [] },
+  { label: 'Nifty Private Bank',            include: ['PRIVATE', 'BANK'],                     exclude: [] },
+  { label: 'Nifty PSU Bank',                include: ['PSU', 'BANK'],                         exclude: [] },
+  { label: 'Nifty Realty',                  include: ['REALTY'],                              exclude: ['REIT'] },
+  { label: 'Nifty REITs & Realty',          include: ['REIT'],                                exclude: [] },
+  { label: 'Nifty Retail',                  include: ['RETAIL'],                              exclude: [] },
+  { label: 'Nifty Telecommunications',      include: ['TELECOM'],                             exclude: ['MIDSMALL', 'MID SMALL'] },
+  { label: 'Nifty Consumer Durables',       include: ['CONSUMER', 'DURABLE'],                 exclude: [] },
+  { label: 'Nifty Oil and Gas',             include: ['OIL', 'GAS'],                          exclude: [] },
+  { label: 'Nifty500 Healthcare',           include: ['HEALTHCARE'],                          exclude: [], requireAny: ['500'] },
+  { label: 'Nifty MidSmall Financial Services', include: ['FINANCIAL', 'SERVICE'],            exclude: [], requireAny: ['MIDSMALL', 'MID SMALL'] },
+  { label: 'Nifty MidSmall Healthcare',     include: ['HEALTHCARE'],                          exclude: [], requireAny: ['MIDSMALL', 'MID SMALL'] },
+  { label: 'Nifty MidSmall IT & Telecom',   include: ['IT', 'TELECOM'],                       exclude: [], requireAny: ['MIDSMALL', 'MID SMALL'] },
+];
+
+
 let multiStrikeMeta = {};
 let multiStrikeSymbolList = [];
 let multiStrikeSelectedToday = false;
@@ -1454,6 +1527,102 @@ async function checkAndFetchVolatilityData(){
     }
   }
 }
+
+const NSE_CM_SYMBOL_MASTER_URL = 'https://public.fyers.in/sym_details/NSE_CM.csv';
+
+// Matches one CSV row's human-readable name against one SECTORAL_INDICES
+// entry's include/exclude/requireAny keyword rules. All matching is
+// case-insensitive and word-based (not raw substring) for anything
+// marked wholeWord, to avoid e.g. "IT" false-matching inside "CAPITAL".
+function sectorNameMatches(csvName, rule){
+  const upper = csvName.toUpperCase();
+  const words = upper.split(/[^A-Z0-9&]+/).filter(Boolean);
+  const contains = (kw) => rule.wholeWord ? words.includes(kw) : upper.includes(kw);
+  if(!rule.include.every(contains)) return false;
+  if(rule.exclude.some(contains)) return false;
+  if(rule.requireAny && !rule.requireAny.some(contains)) return false;
+  return true;
+}
+
+// Looks up each SECTORAL_INDICES entry's actual Fyers symbol from the
+// NSE Capital Market symbol master (same file, same fetch pattern as the
+// existing NSE_FO.csv option-strike lookup) rather than guessing symbol
+// codes. Column layout matches the already-proven NSE_FO.csv parsing:
+// cols[1]=human-readable name, cols[9]=Fyers trading symbol. Index rows
+// are identified by their symbol ending in "-INDEX" - the same suffix
+// already confirmed correct for NIFTY50/NIFTYBANK/SENSEX elsewhere in
+// this file, so no guessing needed for that part either.
+//
+// Deliberately tolerant of individual misses: any sector whose name
+// doesn't cleanly match one CSV row (ambiguous, zero, or multiple
+// matches) is logged and skipped rather than blocking the rest -
+// something to check the very first time this runs, not treated as a
+// hard failure.
+async function resolveSectoralIndexSymbols(){
+  let csvText;
+  try{
+    csvText = await fetchUrl(NSE_CM_SYMBOL_MASTER_URL);
+  } catch(err){
+    console.log(`Sectoral indices: could not fetch NSE_CM.csv symbol master, skipping sectoral indices entirely today: ${err.message}`);
+    return {};
+  }
+
+  const indexRows = []; // { name, symbol }
+  csvText.split('\n').forEach(line => {
+    const cols = line.split(',');
+    if(cols.length < 10) return;
+    const symbol = (cols[9] || '').trim();
+    if(!symbol.endsWith('-INDEX')) return;
+    const name = (cols[1] || '').trim();
+    if(!name) return;
+    indexRows.push({ name, symbol });
+  });
+
+  if(indexRows.length === 0){
+    console.log('Sectoral indices: NSE_CM.csv fetched but zero -INDEX rows found - format may have changed, skipping sectoral indices today.');
+    return {};
+  }
+
+  const resolved = {}; // label -> fyers symbol
+  const unmatched = [];
+  SECTORAL_INDICES.forEach(rule => {
+    const matches = indexRows.filter(row => sectorNameMatches(row.name, rule));
+    if(matches.length === 1){
+      resolved[rule.label] = matches[0].symbol;
+    } else if(matches.length === 0){
+      unmatched.push(`${rule.label} (no match)`);
+    } else {
+      unmatched.push(`${rule.label} (${matches.length} ambiguous matches: ${matches.map(m => m.symbol).join(', ')})`);
+    }
+  });
+
+  console.log(`Sectoral indices: resolved ${Object.keys(resolved).length}/${SECTORAL_INDICES.length} against NSE_CM.csv.`);
+  if(unmatched.length > 0){
+    console.log(`Sectoral indices: could not cleanly resolve ${unmatched.length} - ${unmatched.join('; ')}`);
+  }
+  return resolved;
+}
+
+resolveSectoralIndexSymbols().then(resolved => {
+  sectoralIndexSymbols = resolved;
+  const newSymbols = Object.values(resolved).filter(sym => !state[sym]);
+  newSymbols.forEach(sym => {
+    state[sym] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null };
+    symbols.push(sym);
+  });
+  // Startup ordering: this fetch takes a few seconds, so it's possible
+  // (though unlikely) a login happens fast enough that startFyersConnection()
+  // already subscribed the original `symbols` list before these were
+  // added. If the connection is already live by the time this resolves,
+  // subscribe the new ones directly rather than waiting for the next
+  // reconnect to pick them up.
+  if(newSymbols.length > 0 && fyersSocket && isLive){
+    console.log(`Sectoral indices resolved after connection was already live - subscribing ${newSymbols.length} directly.`);
+    fyersSocket.subscribe(newSymbols);
+  }
+}).catch(err => {
+  console.log('Sectoral indices: unexpected error during resolution, skipping sectoral indices today:', err.message);
+});
 
 function parseStrikesFromCsv(csvText, indexSymbol, atmStrike, interval){
   if(!csvText) return {};
@@ -3844,6 +4013,17 @@ function buildPayload(includeMultiStrike){
       availableDates: deliveryHistoryDates,
       symbolCount: Object.keys(deliveryPctHistory).length,
     },
+    // Sectoral indices - small (at most 32 entries), safe to include in
+    // full on every broadcast rather than needing an on-demand endpoint,
+    // same reasoning as deliveryMap below. label -> {ltp, prevClose,
+    // open, high, low}, reading straight from the same `state` every
+    // other symbol's live data already lives in.
+    sectoralIndices: Object.fromEntries(
+      Object.entries(sectoralIndexSymbols).map(([label, sym]) => [
+        label,
+        state[sym] ? { ltp: state[sym].ltp, prevClose: state[sym].prevClose, open: state[sym].open, high: state[sym].high, low: state[sym].low } : null,
+      ])
+    ),
     // Unlike bhavcopy, deliveryMap is small (~200 symbols, not tens of
     // thousands of rows) - safe to include in full on every broadcast
     // rather than needing a separate on-demand endpoint.
