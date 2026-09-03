@@ -174,6 +174,8 @@ symbols.forEach(s => { state[s] = { open: null, high: null, low: null, ltp: null
 // get modified once resolution completes, but the call itself can't run
 // until its dependencies are actually declared.
 let sectoralIndexSymbols = {};
+let sectoralSymbolList = []; // 2026-09-03: kept SEPARATE from `symbols` (the main subscribe batch) -
+                              // see the resolveSectoralIndexSymbols().then() block below for why.
 
 // The 210 stocks use their own Fyers symbol as both the subscribe symbol
 // AND the state key, so the loop above is sufficient for them. The three
@@ -250,6 +252,30 @@ function recordSubscribeFailure(reason) {
   if (consecutiveSubscribeFailures >= MAX_CONSECUTIVE_FAILURES && !needsRelogin) {
     needsRelogin = true;
     console.log(`*** ${MAX_CONSECUTIVE_FAILURES} consecutive subscribe failures — stopping auto-retry. Visit the app's status page and redo the daily login. ***`);
+    // 2026-09-03 bug fix: setting needsRelogin=true only ever stopped THIS
+    // app's OWN watchdog loop (see the `if(needsRelogin) return;` guard
+    // further down) - it never actually touched the underlying Fyers
+    // socket. Confirmed via a real production log: the fyers-api-v3
+    // library has its OWN independent autoreconnect(6) behavior (enabled
+    // where the socket is created below), completely unaware of this
+    // flag - it kept reconnecting and resubscribing on its own for hours
+    // after this message printed, hammering Fyers with an already-invalid
+    // token roughly every 2 minutes ("trying to reconnect 1" repeating,
+    // never incrementing - its own internal retry counter appears to
+    // reset every cycle rather than counting toward its stated limit of
+    // 6). Explicitly closing (and detaching listeners first) here is the
+    // only way found to actually stop it - same close() method already
+    // used elsewhere in this file when starting a fresh connection.
+    // Listeners removed FIRST so that even if close() itself triggers the
+    // library's own internal reconnect attempt, this app's own 'error'/
+    // 'close' handlers won't still be attached to keep calling
+    // recordSubscribeFailure() again in a loop.
+    if(fyersSocket){
+      try {
+        if(typeof fyersSocket.removeAllListeners === 'function') fyersSocket.removeAllListeners();
+        fyersSocket.close();
+      } catch(e) { /* ignore - best effort */ }
+    }
   }
 }
 
@@ -921,7 +947,14 @@ const SECTORAL_INDICES = [
   { label: 'Nifty Auto',                    include: ['AUTO'],                                exclude: [] },
   { label: 'Nifty Cement',                  include: ['CEMENT'],                              exclude: [] },
   { label: 'Nifty Capital Goods',           include: ['CAPITAL', 'GOODS'],                    exclude: [] },
-  { label: 'Nifty Chemicals',               include: ['CHEMICAL'],                            exclude: [] },
+  // 2026-09-03: 'Nifty Chemicals' removed - confirmed via a real production
+  // log that "NSE:NIFTYCHEMICALS-INDEX" is rejected outright by Fyers'
+  // WebSocket subscribe call ("Please provide valid symbol"), even though
+  // it successfully resolved against the NSE_CM.csv symbol master. That
+  // mismatch (present in the CSV, rejected by the live subscribe) is a
+  // different failure mode than the "not found in CSV" case this feature
+  // was originally built to handle gracefully - the CSV lookup alone
+  // wasn't sufficient proof a symbol is actually subscribable.
   { label: 'Nifty Commercial & Transport',  include: ['COMMERCIAL', 'TRANSPORT'],             exclude: [] },
   { label: 'Nifty Construction',            include: ['CONSTRUCTION'],                        exclude: [] },
   { label: 'Nifty Consumer Services',       include: ['CONSUMER', 'SERVICE'],                 exclude: ['DURABLE'] },
@@ -1605,20 +1638,24 @@ async function resolveSectoralIndexSymbols(){
 
 resolveSectoralIndexSymbols().then(resolved => {
   sectoralIndexSymbols = resolved;
-  const newSymbols = Object.values(resolved).filter(sym => !state[sym]);
-  newSymbols.forEach(sym => {
-    state[sym] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null };
-    symbols.push(sym);
+  // 2026-09-03 bug fix: these used to be pushed directly into the shared
+  // `symbols` array and subscribed in the SAME batch as the core ~213
+  // stocks. Confirmed via a real production log that this was a serious
+  // problem: a single invalid sectoral symbol ("NSE:NIFTYCHEMICALS-INDEX",
+  // present in the CSV master but rejected by the live subscribe call)
+  // caused every single subscribe attempt to fail with the same error,
+  // over and over, for hours - meaning it likely blocked the ENTIRE core
+  // stock subscription too, not just the sectoral indices. Kept
+  // completely separate now (own array, own subscribe call, same
+  // isolation pattern already used for multiStrikeSymbolList above) so a
+  // bad sectoral symbol can never again take down core data.
+  sectoralSymbolList = Object.values(resolved);
+  sectoralSymbolList.forEach(sym => {
+    if(!state[sym]) state[sym] = { open: null, high: null, low: null, ltp: null, volume: null, prevClose: null };
   });
-  // Startup ordering: this fetch takes a few seconds, so it's possible
-  // (though unlikely) a login happens fast enough that startFyersConnection()
-  // already subscribed the original `symbols` list before these were
-  // added. If the connection is already live by the time this resolves,
-  // subscribe the new ones directly rather than waiting for the next
-  // reconnect to pick them up.
-  if(newSymbols.length > 0 && fyersSocket && isLive){
-    console.log(`Sectoral indices resolved after connection was already live - subscribing ${newSymbols.length} directly.`);
-    fyersSocket.subscribe(newSymbols);
+  if(sectoralSymbolList.length > 0 && fyersSocket && isLive){
+    console.log(`Sectoral indices resolved after connection was already live - subscribing ${sectoralSymbolList.length} directly.`);
+    fyersSocket.subscribe(sectoralSymbolList);
   }
 }).catch(err => {
   console.log('Sectoral indices: unexpected error during resolution, skipping sectoral indices today:', err.message);
@@ -3263,6 +3300,14 @@ function startFyersConnection(accessToken) {
       console.log('Subscribing to', symbols.length, 'symbols...');
       fyersSocket.subscribe(symbols);
       isLive = true;
+      // 2026-09-03: sectoral indices subscribed in their OWN, separate
+      // call - deliberately isolated from the core `symbols` batch above.
+      // A bad sectoral symbol failing here can never again take down the
+      // main stock subscription (see the resolveSectoralIndexSymbols
+      // block for the full story on why this isolation was added).
+      if(sectoralSymbolList.length > 0){
+        fyersSocket.subscribe(sectoralSymbolList);
+      }
     }, 6000); // was 2000ms — bumped up since even RECONNECTS (not just brand-new logins) were sometimes hitting a -15 "invalid token" rejection on the first subscribe attempt, suggesting Fyers' side needs a bit longer to fully accept a new WS session than 2s reliably provides
   });
 
