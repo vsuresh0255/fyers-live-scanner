@@ -1616,6 +1616,17 @@ async function resolveSectoralIndexSymbols(){
     return {};
   }
 
+  // 2026-09-03: diagnostic - only 10/33 resolved on the first real run,
+  // including a surprising miss on "Nifty IT" (one of the most liquid,
+  // commonly-referenced sectoral indices there is - if even that one
+  // isn't matching, the assumption about how NSE_CM.csv actually names
+  // these rows is likely wrong, not that the indices don't exist).
+  // Logging every -INDEX row's real (name, symbol) pair found in the CSV
+  // so the actual naming convention can be seen directly, rather than
+  // guessing at the matching rules a second time with no real data to
+  // check them against.
+  console.log(`Sectoral indices: found ${indexRows.length} total -INDEX rows in NSE_CM.csv: ${JSON.stringify(indexRows)}`);
+
   const resolved = {}; // label -> fyers symbol
   const unmatched = [];
   SECTORAL_INDICES.forEach(rule => {
