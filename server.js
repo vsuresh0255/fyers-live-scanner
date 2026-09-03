@@ -4177,6 +4177,15 @@ function scheduleBroadcast() {
 }
 
 server.listen(PORT, () => {
-  console.log(`*** VERSION CHECK: BUILD-${new Date().toISOString()} — if you don't see this exact marker, this deployment is NOT running the latest code ***`);
+  // 2026-09-03 bug fix: this used to be new Date().toISOString(), computed
+  // fresh at SERVER STARTUP - meaning it always looked "new" on any
+  // restart, regardless of whether the actual code changed at all. This
+  // is exactly what caused real confusion diagnosing the sectoral indices
+  // issue - the timestamp kept "updating" across multiple redeploys while
+  // giving zero actual confirmation of which file version was running.
+  // Fixed, hardcoded string now - only changes when I actually edit this
+  // line myself, so seeing it in the logs is real proof this specific
+  // version of the file is the one that's deployed.
+  console.log(`*** VERSION CHECK: BUILD-2026-09-03-sectoral-diagnostic-v2 — if you don't see this exact marker, this deployment is NOT running the latest code ***`);
   console.log(`Server listening on port ${PORT}. Visit your Railway URL to complete daily login.`);
 });
