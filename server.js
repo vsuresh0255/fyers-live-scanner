@@ -4189,3 +4189,5 @@ server.listen(PORT, () => {
   console.log(`*** VERSION CHECK: BUILD-2026-09-03-sectoral-diagnostic-v2 — if you don't see this exact marker, this deployment is NOT running the latest code ***`);
   console.log(`Server listening on port ${PORT}. Visit your Railway URL to complete daily login.`);
 });
+// TEMPORARILY DISABLED before market open - re-enable once the sectoral naming issue is fixed
+if (false)
